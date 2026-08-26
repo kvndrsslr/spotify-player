@@ -130,6 +130,34 @@ impl AppClient {
         })
     }
 
+    /// Snapshot the currently-playing context + track so a recreated session can
+    /// resume the *same* position rather than whatever the cloud reports after the
+    /// old device is torn down (which has no retained queue).
+    fn remember_playback(state: &SharedState) -> Option<crate::state::Playback> {
+        let player = state.player.read();
+        let playback = player.playback.as_ref()?;
+        let uri = match &playback.item {
+            Some(rspotify::model::PlayableItem::Track(track)) => {
+                let id = track.id.as_ref()?;
+                id.uri()
+            }
+            Some(rspotify::model::PlayableItem::Episode(episode)) => {
+                let id = episode.id.as_ref();
+                id.uri()
+            }
+            _ => return None,
+        };
+        match player.playing_context_id() {
+            // A `Tracks` context can't be restarted by uri, so there is no
+            // rememberable playback to re-issue.
+            Some(ContextId::Tracks(_)) | None => None,
+            Some(context_id) => Some(crate::state::Playback::Context(
+                context_id,
+                Some(rspotify::model::Offset::Uri(uri)),
+            )),
+        }
+    }
+
     async fn token(&self) -> Result<String> {
         self.auto_reauth().await?;
         Ok(self
@@ -146,7 +174,15 @@ impl AppClient {
     /// Initialize the application's playback upon creating a new session or during startup.
     ///
     /// `resume` controls whether playback should be (re)started on the device we connect to.
-    pub fn initialize_playback(&self, state: &SharedState, resume: bool) {
+    /// `remembered` is the context+track that was playing before a session recreation; when
+    /// provided it is re-issued at its remembered position instead of inheriting the cloud's
+    /// (empty/stale) playback state.
+    pub fn initialize_playback(
+        &self,
+        state: &SharedState,
+        resume: bool,
+        remembered: Option<crate::state::Playback>,
+    ) {
         tokio::task::spawn({
             let client = self.clone();
             let state = state.clone();
@@ -187,7 +223,19 @@ impl AppClient {
                         } else {
                             tracing::info!("Connection succeeded (device_id={id})!");
                             if resume {
-                                if let Err(err) =
+                                if let Some(remembered) = remembered.as_ref() {
+                                    // Re-issue the remembered context at its remembered track: the
+                                    // fresh device has no retained queue after the old one was
+                                    // torn down, so resuming it would restart a different track.
+                                    if let Err(err) = client
+                                        .start_playback(remembered.clone(), Some(id.as_ref()))
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to resume remembered playback after reconnect: {err:#}"
+                                        );
+                                    }
+                                } else if let Err(err) =
                                     client.resume_playback(Some(id.as_ref()), None).await
                                 {
                                     tracing::warn!(
@@ -220,6 +268,10 @@ impl AppClient {
                 .as_ref()
                 .is_some_and(|p| p.is_playing)
         });
+
+        // Snapshot the currently-playing context + track so the recreated device resumes the
+        // *same* position rather than inheriting the cloud's (empty/stale) playback state.
+        let remembered = state.and_then(Self::remember_playback);
 
         let session = self.auth_config.session();
         let creds = auth::get_creds(&self.auth_config, reauth, true).context("get credentials")?;
@@ -255,7 +307,7 @@ impl AppClient {
         if let Some(state) = state {
             // reset the application's caches
             state.data.write().caches = MemoryCaches::new();
-            self.initialize_playback(state, was_playing);
+            self.initialize_playback(state, was_playing, remembered);
         }
 
         Ok(())
