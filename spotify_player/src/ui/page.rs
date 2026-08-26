@@ -438,6 +438,103 @@ pub fn render_context_page(
     }
 }
 
+/// Index of a library view in the `[playlists, albums, artists, shows]` window ordering.
+fn library_view_index(view: config::LibraryView) -> usize {
+    match view {
+        config::LibraryView::Playlists => 0,
+        config::LibraryView::Albums => 1,
+        config::LibraryView::Artists => 2,
+        config::LibraryView::Shows => 3,
+    }
+}
+
+/// The single-axis stack layout for the four library windows, in
+/// `[playlists, albums, artists, shows]` order (mirrors historical behavior).
+fn stack_library_rects(
+    orientation: Orientation,
+    library: &config::LibraryLayoutConfig,
+    rect: Rect,
+) -> [Rect; 4] {
+    let chunks = orientation
+        .layout([
+            Constraint::Percentage(library.playlist_percent),
+            Constraint::Percentage(library.album_percent),
+            Constraint::Percentage(
+                100 - (library.album_percent + library.playlist_percent + library.show_percent),
+            ),
+            Constraint::Percentage(library.show_percent),
+        ])
+        .split(rect);
+    [chunks[0], chunks[1], chunks[2], chunks[3]]
+}
+
+/// The 2x2 quadrant layout for the four library windows, in `[playlists, albums, artists,
+/// shows]` order, honoring each quadrant's configured view assignment. Sizing derives from the
+/// per-view percents: the top row holds the top-left + top-right views, the bottom row the rest,
+/// and each row splits its two columns proportionally. Returns `None` when the terminal is too
+/// small for a usable grid so the caller can fall back to [`stack_library_rects`].
+fn grid_library_rects(library: &config::LibraryLayoutConfig, rect: Rect) -> Option<[Rect; 4]> {
+    // Quadrants need two usable rows and columns.
+    if rect.width < 60 || rect.height < 10 {
+        return None;
+    }
+
+    let percent_for = |view: config::LibraryView| -> u16 {
+        match view {
+            config::LibraryView::Albums => library.album_percent,
+            config::LibraryView::Playlists => library.playlist_percent,
+            config::LibraryView::Shows => library.show_percent,
+            // Artists take the remainder, mirroring the stack layout.
+            config::LibraryView::Artists => {
+                100 - (library.album_percent + library.playlist_percent + library.show_percent)
+            }
+        }
+    };
+
+    let grid = &library.grid;
+    let tl = percent_for(grid.top_left);
+    let tr = percent_for(grid.top_right);
+    let bl = percent_for(grid.bottom_left);
+    let br = percent_for(grid.bottom_right);
+
+    // `num * 100 / den`, falling back to an even split (50) when `den` is zero.
+    let pct = |num: u32, den: u32| -> u16 {
+        num.checked_mul(100)
+            .and_then(|n| n.checked_div(den))
+            .map_or(50, |v| (v as u16).clamp(1, 99))
+    };
+
+    let top_total = u32::from(tl) + u32::from(tr);
+    let bot_total = u32::from(bl) + u32::from(br);
+    let total = top_total + bot_total;
+    let top_pct = pct(top_total, total);
+
+    let rows = Layout::vertical([Constraint::Percentage(top_pct), Constraint::Fill(1)]).split(rect);
+
+    let col_pct = |left: u16, right: u16| -> u16 {
+        let both = u32::from(left) + u32::from(right);
+        pct(u32::from(left), both)
+    };
+    let top = Layout::horizontal([Constraint::Percentage(col_pct(tl, tr)), Constraint::Fill(1)])
+        .split(rows[0]);
+    let bot = Layout::horizontal([Constraint::Percentage(col_pct(bl, br)), Constraint::Fill(1)])
+        .split(rows[1]);
+
+    // Quadrant rects in position order [TL, TR, BL, BR]; reorder by configured view.
+    let quadrants = [top[0], top[1], bot[0], bot[1]];
+    let views = [
+        grid.top_left,
+        grid.top_right,
+        grid.bottom_left,
+        grid.bottom_right,
+    ];
+    let mut rects = [rect; 4];
+    for (i, view) in views.iter().enumerate() {
+        rects[library_view_index(*view)] = quadrants[i];
+    }
+    Some(rects)
+}
+
 pub fn render_library_page(
     is_active: bool,
     frame: &mut Frame,
@@ -456,49 +553,40 @@ pub fn render_library_page(
     };
 
     // 2. Construct the page's layout
-    // Split the library page into 4 windows:
-    // - a playlists window
-    // - a saved albums window
-    // - a followed artists window
-    // - a saved shows window
-
-    let chunks = ui
-        .orientation
-        .layout([
-            Constraint::Percentage(configs.app_config.layout.library.playlist_percent),
-            Constraint::Percentage(configs.app_config.layout.library.album_percent),
-            Constraint::Percentage(
-                100 - (configs.app_config.layout.library.album_percent
-                    + configs.app_config.layout.library.playlist_percent
-                    + configs.app_config.layout.library.show_percent),
-            ),
-            Constraint::Percentage(configs.app_config.layout.library.show_percent),
-        ])
-        .split(rect);
-
-    let playlist_rect = construct_and_render_block(
-        "Playlists",
-        &ui.theme,
-        match ui.orientation {
-            Orientation::Horizontal => Borders::TOP | Borders::LEFT | Borders::BOTTOM,
-            Orientation::Vertical => Borders::ALL,
+    // The library page renders four windows (playlists, albums, artists, shows), either as a
+    // single-axis stack (default) or, when `library.layout = "grid"`, as a 2x2 quadrant grid
+    // with per-quadrant view assignment. On terminals too small for a usable grid we fall back
+    // to the stack.
+    let library = &configs.app_config.layout.library;
+    let (rects, grid_mode) = match library.layout {
+        config::LibraryLayoutKind::Grid => match grid_library_rects(library, rect) {
+            Some(r) => (r, true),
+            None => (stack_library_rects(ui.orientation, library, rect), false),
         },
-        frame,
-        chunks[0],
-    );
-    let album_rect = construct_and_render_block(
-        "Albums",
-        &ui.theme,
-        match ui.orientation {
-            Orientation::Horizontal => Borders::TOP | Borders::LEFT | Borders::BOTTOM,
-            Orientation::Vertical => Borders::ALL,
-        },
-        frame,
-        chunks[1],
-    );
+        config::LibraryLayoutKind::Stack => {
+            (stack_library_rects(ui.orientation, library, rect), false)
+        }
+    };
+
+    // Quadrants get a full border; the stack keeps its historical shared-edge borders.
+    let orientation = ui.orientation;
+    let border_for = move |idx: usize| -> Borders {
+        if grid_mode {
+            Borders::ALL
+        } else if (idx == 0 || idx == 1) && orientation == Orientation::Horizontal {
+            Borders::TOP | Borders::LEFT | Borders::BOTTOM
+        } else {
+            Borders::ALL
+        }
+    };
+
+    let playlist_rect =
+        construct_and_render_block("Playlists", &ui.theme, border_for(0), frame, rects[0]);
+    let album_rect =
+        construct_and_render_block("Albums", &ui.theme, border_for(1), frame, rects[1]);
     let artist_rect =
-        construct_and_render_block("Artists", &ui.theme, Borders::ALL, frame, chunks[2]);
-    let show_rect = construct_and_render_block("Shows", &ui.theme, Borders::ALL, frame, chunks[3]);
+        construct_and_render_block("Artists", &ui.theme, border_for(2), frame, rects[2]);
+    let show_rect = construct_and_render_block("Shows", &ui.theme, border_for(3), frame, rects[3]);
 
     // 3. Construct the page's widgets
     // Construct the playlist window
@@ -1469,4 +1557,107 @@ pub fn render_logs_page(frame: &mut Frame, state: &SharedState, ui: &mut UIState
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid_cfg(
+        top_left: config::LibraryView,
+        top_right: config::LibraryView,
+        bottom_left: config::LibraryView,
+        bottom_right: config::LibraryView,
+    ) -> config::LibraryLayoutConfig {
+        config::LibraryLayoutConfig {
+            layout: config::LibraryLayoutKind::Grid,
+            playlist_percent: 40,
+            album_percent: 40,
+            show_percent: 0,
+            audiobook_percent: 0,
+            grid: config::LibraryGridLayoutConfig {
+                top_left,
+                top_right,
+                bottom_left,
+                bottom_right,
+            },
+        }
+    }
+
+    #[test]
+    fn grid_falls_back_on_small_terminals() {
+        // Too narrow.
+        assert!(grid_library_rects(
+            &grid_cfg(
+                config::LibraryView::Playlists,
+                config::LibraryView::Albums,
+                config::LibraryView::Artists,
+                config::LibraryView::Shows,
+            ),
+            Rect::new(0, 0, 40, 40)
+        )
+        .is_none());
+        // Too short.
+        assert!(grid_library_rects(
+            &grid_cfg(
+                config::LibraryView::Playlists,
+                config::LibraryView::Albums,
+                config::LibraryView::Artists,
+                config::LibraryView::Shows,
+            ),
+            Rect::new(0, 0, 200, 5)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn grid_places_each_view_in_its_quadrant() {
+        let cfg = grid_cfg(
+            config::LibraryView::Playlists, // TL
+            config::LibraryView::Albums,    // TR
+            config::LibraryView::Artists,   // BL
+            config::LibraryView::Shows,     // BR
+        );
+        let rects = grid_library_rects(&cfg, Rect::new(0, 0, 200, 50)).expect("grid layout");
+        let [playlists, albums, artists, shows] = rects;
+
+        // Every quadrant is non-empty.
+        for r in rects {
+            assert!(r.width > 0 && r.height > 0, "empty quadrant: {r:?}");
+        }
+
+        // Top row sits above the bottom row, left column left of the right column.
+        assert!(
+            playlists.y < artists.y,
+            "playlists should sit above artists"
+        );
+        assert!(albums.y < shows.y, "albums should sit above shows");
+        assert!(
+            playlists.x < albums.x,
+            "playlists should sit left of albums"
+        );
+        assert!(artists.x < shows.x, "artists should sit left of shows");
+
+        // The four rects tile the input rect without overlapping.
+        let mut xs: Vec<u16> = rects.iter().map(|r| r.x).collect();
+        xs.sort_unstable();
+        assert_eq!(xs[0], 0, "leftmost quadrant should start at x=0");
+    }
+
+    #[test]
+    fn grid_respects_custom_quadrant_assignment() {
+        // Move Shows to the top-left and Playlists to the bottom-right.
+        let cfg = grid_cfg(
+            config::LibraryView::Shows,
+            config::LibraryView::Albums,
+            config::LibraryView::Artists,
+            config::LibraryView::Playlists,
+        );
+        let rects = grid_library_rects(&cfg, Rect::new(0, 0, 200, 50)).expect("grid layout");
+        let [playlists, _albums, _artists, shows] = rects;
+
+        // Playlists is now bottom-right, Shows top-left.
+        assert!(playlists.y > shows.y, "playlists should be below shows");
+        assert!(playlists.x > shows.x, "playlists should be right of shows");
+    }
 }

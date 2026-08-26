@@ -233,13 +233,48 @@ pub struct LayoutConfig {
     pub detail_window_image: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryLayoutKind {
+    /// The default single-axis stack of library windows.
+    Stack,
+    /// A 2x2 quadrant grid of library windows (vertical + horizontal tiling).
+    Grid,
+}
+config_parser_impl!(LibraryLayoutKind);
+
+/// A library window that can be placed in a quadrant of the grid layout.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryView {
+    Playlists,
+    Albums,
+    Artists,
+    Shows,
+}
+config_parser_impl!(LibraryView);
+
+/// Which library window each of the four grid quadrants hosts.
+///
+/// Sizing derives from the per-view `*_percent` fields in [`LibraryLayoutConfig`]: the grid is
+/// split into a top row (top-left + top-right views) and a bottom row, then each row is split
+/// into its two columns proportionally to those views' percents. This lets the vertical divider
+/// differ between the two rows (a dashboard mosaic).
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+pub struct LibraryGridLayoutConfig {
+    pub top_left: LibraryView,
+    pub top_right: LibraryView,
+    pub bottom_left: LibraryView,
+    pub bottom_right: LibraryView,
+}
+
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
 pub struct LibraryLayoutConfig {
+    pub layout: LibraryLayoutKind,
     pub playlist_percent: u16,
     pub album_percent: u16,
     pub show_percent: u16,
     pub audiobook_percent: u16,
+    pub grid: LibraryGridLayoutConfig,
 }
 
 #[allow(dead_code)]
@@ -426,10 +461,17 @@ impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
             library: LibraryLayoutConfig {
+                layout: LibraryLayoutKind::Stack,
                 playlist_percent: 40,
                 album_percent: 40,
                 show_percent: 0,
                 audiobook_percent: 0,
+                grid: LibraryGridLayoutConfig {
+                    top_left: LibraryView::Playlists,
+                    top_right: LibraryView::Albums,
+                    bottom_left: LibraryView::Artists,
+                    bottom_right: LibraryView::Shows,
+                },
             },
             playback_window_position: Position::Top,
             playback_window_height: 6,
