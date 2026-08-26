@@ -53,6 +53,9 @@ pub struct AppClient {
     api_client: WebApiClient,
     #[cfg(feature = "streaming")]
     stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
+    /// Guards the post-change playback poll so rapid player events coalesce into a single
+    /// in-flight loop rather than flooding Spotify's Web API (which 429 rate-limits).
+    update_playback_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Deref for AppClient {
@@ -127,6 +130,7 @@ impl AppClient {
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
+            update_playback_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -199,7 +203,7 @@ impl AppClient {
 
                     if let Err(err) = client.retrieve_current_playback(&state, false).await {
                         tracing::error!("Failed to retrieve current playback: {err:#}");
-                        return;
+                        continue;
                     }
 
                     // if playback exists, don't connect to a new device
@@ -766,16 +770,25 @@ impl AppClient {
 
     pub fn update_playback(&self, state: &SharedState) {
         // After handling a request changing the player's playback,
-        // update the playback state by making multiple get-playback requests.
+        // update the playback state by making a few get-playback requests.
         //
-        // Q: Why do we need more than one request to update the playback?
-        // A: It might take a while for Spotify server to reflect the new change,
-        // making additional requests can help ensure that the playback state is always up-to-date.
+        // Q: Why do we need more than one request?
+        // A: It can take a moment for Spotify to reflect the change. Rapid player events each
+        // triggering this loop would otherwise flood the Web API and trip its 429 rate limit, so
+        // coalesce them into a single in-flight loop.
+        if self
+            .update_playback_in_flight
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+
         let client = self.clone();
         let state = state.clone();
+        let in_flight = self.update_playback_in_flight.clone();
         tokio::task::spawn(async move {
             let delay = std::time::Duration::from_secs(1);
-            for _ in 0..5 {
+            for _ in 0..2 {
                 tokio::time::sleep(delay).await;
                 if let Err(err) = client.retrieve_current_playback(&state, false).await {
                     tracing::error!(
@@ -783,6 +796,7 @@ impl AppClient {
                     );
                 }
             }
+            in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
