@@ -234,7 +234,7 @@ pub async fn new_connection(
     let epoch = client.stream_epoch();
     let watch_client = client.clone();
 
-    let player_event_task = tokio::task::spawn({
+    tokio::task::spawn({
         let mut channel = player.get_player_event_channel();
         async move {
             let mut pause_armed = pause_on_startup;
@@ -318,17 +318,12 @@ pub async fn new_connection(
         .await
         .context("initialize spirc")?;
 
-    // Watchdog: when `spirc_task` ends, the integrated Connect device has
-    // stopped being active (link dropped, idle timeout, network loss) *or* the
-    // connection was deliberately shut down during a reconnect. Distinguish the
-    // two via the connection epoch: deliberate reconnects advance it
-    // (see `AppClient::advance_stream_epoch`), so an unchanged epoch means the
-    // link dropped unexpectedly — notify the session watcher to re-establish it.
+    // Watch only `spirc_task`: it is the Connect link's lifetime signal (it owns
+    // the player). `player_event_task`'s channel closes when that player drops,
+    // so it terminates together with `spirc_task`; selecting on it here would
+    // allow a stale/independent termination to spuriously trigger a reconnect.
     tokio::task::spawn(async move {
-        tokio::select! {
-            () = spirc_task => {},
-            _ = player_event_task => {}
-        }
+        spirc_task.await;
         if watch_client.stream_epoch() == epoch {
             tracing::warn!(
                 "Integrated Connect link dropped unexpectedly; notifying the session watcher to reconnect"
