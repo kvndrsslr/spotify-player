@@ -36,7 +36,7 @@ use base64::Engine;
 use image::DynamicImage;
 use ratatui::{
     buffer::CellDiffOption,
-    layout::{Rect, Size},
+    layout::Rect,
     Frame,
 };
 use ratatui_image::{
