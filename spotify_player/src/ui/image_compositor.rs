@@ -85,7 +85,6 @@ enum Encoded {
     /// protocols (kitty) whose data needs interval refreshes; glyph painters opt out.
     Widget {
         protocol: Box<StatefulProtocol>,
-        size: Size,
         scheduled: bool,
     },
     /// A cursor-anchored iTerm2 inline-image escape written straight to stdout.
@@ -225,7 +224,6 @@ impl Surface {
         } else {
             Encoded::Widget {
                 protocol: Box::new(picker.new_resize_protocol(img.clone())),
-                size: area.into(),
                 scheduled: picker.protocol_type() == ProtocolType::Kitty,
             }
         };

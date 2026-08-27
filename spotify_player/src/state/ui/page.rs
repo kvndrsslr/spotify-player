@@ -3,7 +3,6 @@ use crate::{
     ui::single_line_input::LineInput,
 };
 use ratatui::widgets::{ListState, TableState};
-use rspotify::model::Id;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PageState {
