@@ -16,6 +16,14 @@
 //! `resize_encode` keeps the same image id, so live placements update in place and deleted ones
 //! are restored by the next placeholder emission. Glyph-painted protocols (halfblocks,
 //! sixel-as-widget) redraw from the buffer diff every frame and never need scheduled refreshes.
+//!
+//! Burst coalescing: at UI refresh rates around 32ms, dragging quickly through an episode list
+//! produces a new `(url, area)` target nearly every frame; encoding and transmitting a full
+//! image per step starves the terminal's graphics pipeline and reads as images flickering or
+//! vanishing. Requests that arrive within [`URL_SETTLE_WINDOW`] of the previous change only
+//! *record* the desired target — the previous surface keeps painting (cheap: no cell damage, no
+//! transmission) until inputs go quiet, and exactly one encode/transmit carries the final
+//! selection.
 
 use std::{
     collections::HashMap,
@@ -40,12 +48,25 @@ use ratatui_image::{
 /// Backstop interval between forced re-transmissions of grid-anchored surfaces.
 pub const TRANSMIT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Quiet period a stream of image-target changes must reach before exactly one encode +
+/// transmit is issued for the latest target.
+const URL_SETTLE_WINDOW: Duration = Duration::from_millis(150);
+
 /// Cache of prepared cover surfaces keyed by stable caller-declared slots.
 #[derive(Default)]
 pub struct ImageCompositor {
-    slots: HashMap<&'static str, Surface>,
+    slots: HashMap<&'static str, Slot>,
     /// Monotonic frame counter; bumped once per UI pass by [`ImageCompositor::begin_frame`].
     epoch: u64,
+}
+
+/// Per-slot state: the currently encoded surface plus burst-coalescing bookkeeping.
+struct Slot {
+    surface: Surface,
+    /// The last *observed* request, distinct from `surface.url` while a burst is deferred.
+    requested_url: Option<String>,
+    requested_area: Option<Rect>,
+    last_change: Option<Instant>,
 }
 
 /// A cover image encoded once per `(url, area)` pair and kept alive across frames.
@@ -85,36 +106,69 @@ impl ImageCompositor {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// Draw `img` into `area`, healing or re-encoding the slot's surface first if needed.
+    /// Draw the cover identified by `img`/`url` into `area`.
+    ///
+    /// Honors healing (skipped frames / interval backstop) and coalesces rapid target changes
+    /// into a single re-encode after [`URL_SETTLE_WINDOW`] of silence.
     pub fn render(
         &mut self,
         frame: &mut Frame,
         picker: &Picker,
-        slot: &'static str,
+        slot_id: &'static str,
         url: &str,
         img: &DynamicImage,
         area: Rect,
     ) {
         let now = Instant::now();
-        let needs_prepare = match self.slots.get(slot) {
-            Some(surface) => surface.url != url || surface.area != area,
-            None => true,
-        };
-        if needs_prepare {
-            match Surface::prepare(picker, url, img, area, self.epoch) {
-                Ok(surface) => {
-                    self.slots.insert(slot, surface);
+
+        let slot = match self.slots.get_mut(slot_id) {
+            Some(slot) => {
+                // Only genuine target changes reset the settle clock; identical repeats are
+                // free observations that let a deferred burst settle.
+                if slot.requested_url.as_deref() != Some(url) || slot.requested_area != Some(area) {
+                    slot.requested_url = Some(url.to_owned());
+                    slot.requested_area = Some(area);
+                    slot.last_change = Some(now);
                 }
-                Err(err) => {
-                    tracing::error!("Failed to encode image for slot `{slot}`: {err:#}");
-                    return;
+
+                let changed = slot.surface.url != url || slot.surface.area != area;
+                let settled = slot
+                    .last_change
+                    .is_none_or(|t| now.duration_since(t) >= URL_SETTLE_WINDOW);
+                if changed && settled {
+                    match Surface::prepare(picker, url, img, area, self.epoch) {
+                        Ok(surface) => slot.surface = surface,
+                        Err(err) => {
+                            tracing::error!("Failed to encode image for slot `{slot_id}`: {err:#}");
+                            return;
+                        }
+                    }
+                }
+                slot
+            }
+            None => {
+                // First sighting: encode immediately so the very first paint is correct.
+                match Surface::prepare(picker, url, img, area, self.epoch) {
+                    Ok(surface) => {
+                        let slot = Slot {
+                            surface,
+                            requested_url: Some(url.to_owned()),
+                            requested_area: Some(area),
+                            last_change: Some(now),
+                        };
+                        self.slots.insert(slot_id, slot);
+                        self.slots.get_mut(slot_id).expect("just inserted")
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to encode image for slot `{slot_id}`: {err:#}");
+                        return;
+                    }
                 }
             }
-        }
-
-        let Some(surface) = self.slots.get_mut(slot) else {
-            return;
         };
+
+        let surface = &mut slot.surface;
+
         // A skipped frame while this slot stayed idle means something else painted its cells
         // (popup overlay, page switch, a cache-miss gap): the terminal may have dropped the
         // placement, so force one healing re-emission before drawing again.
@@ -239,6 +293,28 @@ fn write_iterm2(escape: &str, area: Rect) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
+
+    static AREA: LazyLock<Rect> = LazyLock::new(|| Rect::new(1, 1, 4, 2));
+
+    fn banded_img() -> DynamicImage {
+        image::DynamicImage::from(image::ImageBuffer::<image::Rgb<u8>, _>::from_fn(
+            8,
+            8,
+            |_x, y| {
+                if y < 4 {
+                    image::Rgb([255, 255, 255])
+                } else {
+                    image::Rgb([0, 0, 0])
+                }
+            },
+        ))
+    }
+
+    fn flat_img() -> DynamicImage {
+        image::DynamicImage::new_rgb8(8, 8)
+    }
 
     #[test]
     fn refresh_is_due_when_never_drawn() {
@@ -261,9 +337,8 @@ mod tests {
 
     #[test]
     fn skipped_frames_trigger_heal_then_settle() {
-        let picker = ratatui_image::picker::Picker::halfblocks();
-        let img = image::DynamicImage::new_rgb8(8, 8);
-        let area = Rect::new(1, 1, 4, 2);
+        let picker = Picker::halfblocks();
+        let img = flat_img();
 
         let mut compositor = ImageCompositor::default();
         let mut terminal =
@@ -271,7 +346,7 @@ mod tests {
 
         compositor.begin_frame();
         terminal
-            .draw(|f| compositor.render(f, &picker, "s", "url://a", &img, area))
+            .draw(|f| compositor.render(f, &picker, "s", "url://a", &img, *AREA))
             .unwrap();
 
         // Two skipped frames while the slot stayed idle.
@@ -279,28 +354,17 @@ mod tests {
         compositor.begin_frame();
 
         terminal
-            .draw(|f| compositor.render(f, &picker, "s", "url://a", &img, area))
+            .draw(|f| compositor.render(f, &picker, "s", "url://a", &img, *AREA))
             .unwrap();
         // Same url proves no rebuild happened; the gap alone forced the healing pass.
-        assert_eq!(compositor.slots["s"].url, "url://a");
-        assert_eq!(compositor.slots["s"].last_frame, compositor.epoch);
+        assert_eq!(compositor.slots["s"].surface.url, "url://a");
+        assert_eq!(compositor.slots["s"].surface.last_frame, compositor.epoch);
     }
 
-    #[test]
-    fn halfblocks_widget_renders_glyphs_across_frames() {
-        let picker = ratatui_image::picker::Picker::halfblocks();
-        let img = image::DynamicImage::from(image::ImageBuffer::<image::Rgb<u8>, _>::from_fn(
-            8,
-            8,
-            |_x, y| {
-                if y < 4 {
-                    image::Rgb([255, 255, 255])
-                } else {
-                    image::Rgb([0, 0, 0])
-                }
-            },
-        ));
-        let area = Rect::new(1, 1, 4, 2);
+    #[tokio::test(flavor = "current_thread")]
+    async fn halfblocks_widget_renders_glyphs_across_frames() {
+        let picker = Picker::halfblocks();
+        let img = banded_img();
 
         let mut compositor = ImageCompositor::default();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6))
@@ -308,36 +372,67 @@ mod tests {
         for _ in 0..3 {
             terminal
                 .draw(|frame| {
-                    compositor.render(frame, &picker, "episode-detail", "url://a", &img, area);
+                    compositor.render(frame, &picker, "episode-detail", "url://a", &img, *AREA);
                 })
                 .expect("draw");
         }
 
-        let painted = (area.top()..area.bottom())
-            .flat_map(|y| (area.left()..area.right()).map(move |x| (x, y)))
+        let painted = (AREA.top()..AREA.bottom())
+            .flat_map(|y| (AREA.left()..AREA.right()).map(move |x| (x, y)))
             .filter(|&(x, y)| terminal.backend().buffer().get(x, y).symbol() != " ")
             .count();
         assert!(painted > 0, "halfblocks cover left no glyphs in its area");
     }
 
-    #[test]
-    fn url_change_replaces_surface_wholesale() {
-        let picker = ratatui_image::picker::Picker::halfblocks();
-        let img = image::DynamicImage::new_rgb8(8, 8);
-        let area = Rect::new(1, 1, 4, 2);
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_burst_defers_and_settles_on_latest_target() {
+        let picker = Picker::halfblocks();
+        let img = flat_img();
 
         let mut compositor = ImageCompositor::default();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6)).expect("terminal");
 
-        terminal
-            .draw(|f| compositor.render(f, &picker, "s", "url://a", &img, area))
-            .unwrap();
-        assert_eq!(compositor.slots.len(), 1);
+        let first_target = "url://a";
+        let last_target = "url://c";
 
+        compositor.begin_frame();
         terminal
-            .draw(|f| compositor.render(f, &picker, "s", "url://b", &img, area))
+            .draw(|f| compositor.render(f, &picker, "s", first_target, &img, *AREA))
             .unwrap();
-        assert_eq!(compositor.slots["s"].url, "url://b");
+        assert_eq!(compositor.slots["s"].surface.url, first_target);
+
+        // Rapidly cycling targets inside the settle window must not re-encode anything.
+        for url in ["url://b", "url://c", "url://b", first_target] {
+            std::thread::sleep(URL_SETTLE_WINDOW / 4);
+            compositor.begin_frame();
+            terminal
+                .draw(|f| compositor.render(f, &picker, "s", url, &img, *AREA))
+                .unwrap();
+        }
+        assert_eq!(
+            compositor.slots["s"].surface.url, first_target,
+            "bursting changes must not trigger re-encodes"
+        );
+
+        // Once inputs settle, exactly the latest target gets encoded: the first call records
+        // the change and defers within its settle window, the next adopts it.
+        terminal
+            .draw(|f| compositor.render(f, &picker, "s", last_target, &img, *AREA))
+            .unwrap();
+        assert_eq!(
+            compositor.slots["s"].surface.url, first_target,
+            "freshly observed target must defer like any burst step"
+        );
+
+        std::thread::sleep(URL_SETTLE_WINDOW + Duration::from_millis(20));
+        compositor.begin_frame();
+        terminal
+            .draw(|f| compositor.render(f, &picker, "s", last_target, &img, *AREA))
+            .unwrap();
+        assert_eq!(
+            compositor.slots["s"].surface.url, last_target,
+            "settled state must adopt the latest selection"
+        );
     }
 }
