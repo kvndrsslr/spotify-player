@@ -30,6 +30,7 @@ use rspotify::{http::Query, prelude::*};
 mod handlers;
 mod request;
 mod spotify;
+mod volume;
 
 pub use handlers::*;
 pub use request::*;
@@ -46,6 +47,8 @@ const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
 #[derive(Clone)]
 pub struct AppClient {
     http: reqwest::Client,
+    /// Coalesces bursts of remote (Web API) volume adjustments into single calls.
+    remote_volume: volume::RemoteVolume,
     /// The integrated Spotify client, mainly used for streaming and librespot integration
     spotify: Arc<spotify::Spotify>,
     auth_config: AuthConfig,
@@ -236,6 +239,17 @@ impl AppClient {
         auth::prompt_for_user_token(&mut api_client, false)
             .await
             .context("authenticate Spotify Web API client")?;
+        // Coalescer for Web API volume updates on external devices; spawned under this
+        // constructor's tokio runtime context.
+        let auth_api = api_client.clone();
+        let remote_volume = volume::RemoteVolume::new(move |device, volume_percent| {
+            let auth_api = auth_api.clone();
+            Box::pin(async move {
+                if let Err(err) = auth_api.volume(volume_percent, device.as_deref()).await {
+                    tracing::warn!("Failed to apply remote volume: {err:#}");
+                }
+            })
+        });
 
         #[cfg(feature = "streaming")]
         let (stream_drop_tx, stream_drop_rx) = flume::unbounded();
@@ -245,6 +259,7 @@ impl AppClient {
             http: reqwest::Client::new(),
             auth_config,
             api_client,
+            remote_volume,
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
@@ -256,6 +271,51 @@ impl AppClient {
             stream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             update_playback_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Apply a volume change directly through the integrated player's local mixer.
+    ///
+    /// Returns `true` when the active playback device is this process' own integrated client
+    /// and the volume was applied via librespot's spirc (no Web API roundtrip); `false` when
+    /// the request must fall back to the debounced Web API path.
+    #[cfg(feature = "streaming")]
+    async fn set_integrated_volume(
+        &self,
+        playback_device: Option<&str>,
+        volume_percent: u8,
+    ) -> bool {
+        let Some(device) = playback_device else {
+            return false;
+        };
+        let session = self.spotify.session().await;
+        if session.is_invalid() || session.device_id() != device {
+            return false;
+        }
+        match self.stream_conn.lock().as_ref() {
+            Some(spirc) => {
+                // The app uses percentage volume (0-100); librespot's connect state uses 0-65535.
+                let volume = (f64::from(volume_percent) / 100.0 * 65_535.0).round() as u16;
+                match spirc.set_volume(volume) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!("Failed to set integrated volume locally: {err:#}");
+                        false
+                    }
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// See [`Self::set_integrated_volume`]; without the streaming feature there is no
+    /// integrated player, so every volume change targets the debounced remote path.
+    #[cfg(not(feature = "streaming"))]
+    async fn set_integrated_volume(
+        &self,
+        _playback_device: Option<&str>,
+        _volume_percent: u8,
+    ) -> bool {
+        false
     }
 
     /// Snapshot the currently-playing context + track so a recreated session can
@@ -575,7 +635,14 @@ impl AppClient {
                 playback.shuffle_state = !playback.shuffle_state;
             }
             PlayerRequest::Volume(volume) => {
-                self.volume(volume, device_id).await?;
+                if !self
+                    .set_integrated_volume(playback.device_id.as_deref(), volume)
+                    .await
+                {
+                    self.remote_volume
+                        .push(playback.device_id.clone(), volume)
+                        .await;
+                }
 
                 playback.volume = Some(u32::from(volume));
                 playback.mute_state = None;
@@ -583,11 +650,24 @@ impl AppClient {
             PlayerRequest::ToggleMute => {
                 let new_mute_state = match playback.mute_state {
                     None => {
-                        self.volume(0, device_id).await?;
+                        if !self
+                            .set_integrated_volume(playback.device_id.as_deref(), 0)
+                            .await
+                        {
+                            self.remote_volume.push(playback.device_id.clone(), 0).await;
+                        }
                         Some(playback.volume.unwrap_or_default())
                     }
-                    Some(volume) => {
-                        self.volume(volume as u8, device_id).await?;
+                    Some(restore) => {
+                        let percent = u8::try_from(restore).unwrap_or(u8::MAX);
+                        if !self
+                            .set_integrated_volume(playback.device_id.as_deref(), percent)
+                            .await
+                        {
+                            self.remote_volume
+                                .push(playback.device_id.clone(), percent)
+                                .await;
+                        }
                         None
                     }
                 };
