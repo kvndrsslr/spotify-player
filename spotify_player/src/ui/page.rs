@@ -1473,7 +1473,7 @@ fn render_episode_detail_footer(
                 }),
             ..
         } => (*focus == ShowFocusState::Details, *description_scroll),
-        _ => (false, 0),
+        _ => return,
     };
 
     let inner = construct_and_render_block("Description", &ui.theme, Borders::ALL, frame, rect);
@@ -1553,13 +1553,31 @@ fn render_episode_detail_footer(
         frame.render_widget(Paragraph::new(header).style(header_style), chunks[0]);
     }
 
-    frame.render_widget(
-        Paragraph::new(episode.description.clone())
-            .wrap(Wrap { trim: true })
-            .scroll((description_scroll, 0))
-            .style(Style::default()),
-        chunks[1],
-    );
+    // Clamp the scroll offset to the wrapped content height. `description_scroll` can exceed
+    // the end (saturating scroll handlers, and `u16::MAX` from scroll-to-bottom); clamping at
+    // render both stops at the end and keeps the stored value usable for scrolling back up.
+    let paragraph = Paragraph::new(episode.description.clone())
+        .wrap(Wrap { trim: true })
+        .style(Style::default());
+    let max_scroll = paragraph
+        .line_count(chunks[1].width)
+        .saturating_sub(chunks[1].height as usize) as u16;
+    let clamped = description_scroll.min(max_scroll);
+    if clamped != description_scroll {
+        if let PageState::Context {
+            state:
+                Some(ContextPageUIState::Show {
+                    description_scroll: stored,
+                    ..
+                }),
+            ..
+        } = ui.current_page_mut()
+        {
+            *stored = clamped;
+        }
+    }
+
+    frame.render_widget(paragraph.scroll((clamped, 0)), chunks[1]);
 }
 pub fn render_logs_page(frame: &mut Frame, state: &SharedState, ui: &mut UIStateGuard, rect: Rect) {
     let rect = construct_and_render_block("Logs", &ui.theme, Borders::ALL, frame, rect);
