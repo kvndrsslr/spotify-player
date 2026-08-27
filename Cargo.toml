@@ -22,3 +22,9 @@ cast_precision_loss = { level = "allow", priority = 20 }
 missing_errors_doc = { level = "allow", priority = 20 }
 similar_names = { level = "allow", priority = 20 }
 too_many_lines = { level = "allow", priority = 20 }
+
+# Patched fork of the unmaintained `block` crate (pulled in via souvlaki → cocoa).
+# Upstream's `enum Class {}` extern static triggers a future-incompat lint; the vendored
+# copy in vendor/block/ replaces it with an ABI-identical zero-sized struct.
+[patch.crates-io]
+block = { path = "vendor/block" }
