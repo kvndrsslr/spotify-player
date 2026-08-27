@@ -42,7 +42,7 @@ use ratatui::{
 use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
-    Resize, ResizeEncodeRender, StatefulImage,
+    StatefulImage,
 };
 
 /// Backstop interval between forced re-transmissions of grid-anchored surfaces.
@@ -170,32 +170,37 @@ impl ImageCompositor {
         let surface = &mut slot.surface;
 
         // A skipped frame while this slot stayed idle means something else painted its cells
-        // (popup overlay, page switch, a cache-miss gap): the terminal may have dropped the
-        // placement, so force one healing re-emission before drawing again.
+        // (popup overlay, page switch, a cache-miss gap) — or the terminal drifted for any
+        // other reason (scrolled placement, dropped image data). A same-id re-encode can be
+        // invisible in both cases: re-emitted placeholder rows are byte-identical, so
+        // ratatui's diff emits nothing while the terminal-side pixels are gone. Healing
+        // therefore rebuilds the surface with a FRESH image id: every placeholder row's
+        // symbol changes, ratatui re-emits the whole block, and the terminal places the new
+        // image at the current absolute cells.
         let missed_frames = self.epoch.saturating_sub(surface.last_frame) > 1;
         let needs_heal =
             missed_frames || (surface.scheduled() && refresh_due(Some(surface.last_emitted), now));
         if needs_heal {
-            surface.last_emitted = now;
-            match &mut surface.kind {
-                Encoded::Widget {
-                    protocol,
-                    size,
-                    scheduled,
-                } => {
-                    if *scheduled {
-                        protocol.resize_encode(&Resize::Fit(None), *size);
+            match Surface::prepare(picker, url, img, area, self.epoch) {
+                Ok(fresh) => {
+                    // Direct-write iTerm2 bypasses the buffer entirely: push the fresh
+                    // escape now. Widget surfaces re-transmit through the render below.
+                    if let Encoded::Iterm2 { escape } = &fresh.kind {
+                        if let Err(err) = write_iterm2(escape, area) {
+                            tracing::error!("Failed to draw iTerm2 cover image: {err:#}");
+                        }
                     }
+                    slot.surface = fresh;
                 }
-                Encoded::Iterm2 { escape } => {
-                    if let Err(err) = write_iterm2(escape, area) {
-                        tracing::error!("Failed to draw iTerm2 cover image: {err:#}");
-                    }
+                Err(err) => {
+                    tracing::error!("Failed to re-encode image for slot `{slot_id}`: {err:#}");
                 }
             }
         }
-        surface.last_frame = self.epoch;
+        slot.surface.last_frame = self.epoch;
+        slot.surface.last_emitted = now;
 
+        let surface = &mut slot.surface;
         match &mut surface.kind {
             Encoded::Widget { protocol, .. } => {
                 frame.render_stateful_widget(StatefulImage::new(), area, protocol.as_mut());
