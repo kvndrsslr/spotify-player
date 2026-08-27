@@ -1149,13 +1149,27 @@ impl AppClient {
         let state = state.clone();
         let in_flight = self.update_playback_in_flight.clone();
         tokio::task::spawn(async move {
-            let delay = std::time::Duration::from_secs(1);
-            for _ in 0..2 {
-                tokio::time::sleep(delay).await;
+            // Startup catch-up: the integrated player starts audio locally while Spotify's
+            // Web API still reports "no active playback" (device registration + eventual
+            // consistency). Keep polling at a 1s cadence until the state actually shows up,
+            // bounded so an idle connected session doesn't poll forever. With playback
+            // already visible, two fetches ~1s apart settle a change as before.
+            let mut attempts = 0u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if let Err(err) = client.retrieve_current_playback(&state, false).await {
                     tracing::error!(
                         "Encountered an error when updating the playback state: {err:#}"
                     );
+                }
+                attempts += 1;
+
+                let ready = {
+                    let player = state.player.read();
+                    player.playback.is_some() && player.buffered_playback.is_some()
+                };
+                if (ready && attempts >= 2) || attempts >= 30 {
+                    break;
                 }
             }
             in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2314,7 +2328,6 @@ impl AppClient {
                     playback
                 });
             }
-
             new_playback
         };
 
