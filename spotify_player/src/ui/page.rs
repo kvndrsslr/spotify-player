@@ -1437,7 +1437,16 @@ fn render_episode_detail_footer(
     show: &Show,
     episodes: &[&Episode],
 ) {
-    let selected = ui.current_page_mut().selected().unwrap_or_default();
+    // Read the cursor straight from the episode table: `PageState::selected()` returns None
+    // while the Details panel is focused (key-routing distinction), which must not make the
+    // description snap back to the first episode.
+    let selected = match ui.current_page_mut() {
+        PageState::Context {
+            state: Some(ContextPageUIState::Show { episode_table, .. }),
+            ..
+        } => episode_table.selected().unwrap_or(0),
+        _ => 0,
+    };
     let Some(episode) = episodes.get(selected) else {
         return;
     };
