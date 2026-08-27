@@ -35,6 +35,12 @@ pub struct UIState {
 
     /// Count prefix for vim-style navigation (e.g., 5j, 10k)
     pub count_prefix: Option<usize>,
+
+    /// The last locally commanded volume target. Volume events compute against this instead
+    /// of the racy shared `buffered_playback`, so rapid events (scroll wheel) can't step on
+    /// each other; the client task clears it once the change is applied.
+    pub volume_target: Option<u8>,
+
     /// Image urls awaiting a background fetch, with retry attempt counts. Render paths enqueue
     /// cache misses here plus the moving prefetch window around the selected episode; the
     /// client task drains them.
@@ -122,6 +128,7 @@ impl Default for UIState {
 
             count_prefix: None,
 
+            volume_target: None,
             #[cfg(feature = "image")]
             image_fetch_queue: Vec::new(),
             #[cfg(feature = "image")]

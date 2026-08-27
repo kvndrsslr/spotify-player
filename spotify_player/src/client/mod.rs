@@ -840,6 +840,7 @@ impl AppClient {
                 state.data.write().user_data.user = Some(user);
             }
             ClientRequest::Player(request) => {
+                let is_volume = matches!(&request, PlayerRequest::Volume(_));
                 let seek_to = match &request {
                     PlayerRequest::SeekTrack(position) => Some(*position),
                     _ => None,
@@ -847,6 +848,11 @@ impl AppClient {
                 let playback = state.player.read().buffered_playback.clone();
                 let playback = self.handle_player_request(request, playback).await?;
                 state.player.write().buffered_playback = playback;
+                if is_volume {
+                    // The commanded target is now applied locally; drop the pending rebase
+                    // so the next scroll tick computes from fresh state.
+                    state.ui.lock().volume_target = None;
+                }
                 if let Some(position) = seek_to {
                     // Reflect a seek immediately in local state so the progress bar jumps right
                     // away; the background `update_playback()` poll reconciles the exact

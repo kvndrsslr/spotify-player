@@ -72,21 +72,39 @@ fn handle_mouse_event(
     match event.kind {
         crossterm::event::MouseEventKind::ScrollUp if enable_scroll => {
             let step = config::get_config().app_config.volume_scroll_step;
-            if let Some(ref playback) = state.player.read().buffered_playback {
-                if let Some(volume) = playback.volume {
-                    let new_volume = std::cmp::min(volume as u8 + step, 100);
-                    client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
-                }
-            }
+            let mut ui = state.ui.lock();
+            let base = ui
+                .volume_target
+                .or_else(|| {
+                    state
+                        .player
+                        .read()
+                        .buffered_playback
+                        .as_ref()
+                        .and_then(|p| p.volume.map(|v| v as u8))
+                })
+                .unwrap_or(0);
+            let new_volume = std::cmp::min(base + step, 100);
+            ui.volume_target = Some(new_volume);
+            client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
         }
         crossterm::event::MouseEventKind::ScrollDown if enable_scroll => {
             let step = config::get_config().app_config.volume_scroll_step;
-            if let Some(ref playback) = state.player.read().buffered_playback {
-                if let Some(volume) = playback.volume {
-                    let new_volume = (volume as u8).saturating_sub(step);
-                    client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
-                }
-            }
+            let mut ui = state.ui.lock();
+            let base = ui
+                .volume_target
+                .or_else(|| {
+                    state
+                        .player
+                        .read()
+                        .buffered_playback
+                        .as_ref()
+                        .and_then(|p| p.volume.map(|v| v as u8))
+                })
+                .unwrap_or(0);
+            let new_volume = base.saturating_sub(step);
+            ui.volume_target = Some(new_volume);
+            client_pub.send(ClientRequest::Player(PlayerRequest::Volume(new_volume)))?;
         }
         // a left click event
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -609,12 +627,24 @@ fn handle_global_command(
             client_pub.send(ClientRequest::Player(PlayerRequest::Shuffle))?;
         }
         Command::VolumeChange { offset } => {
-            if let Some(ref playback) = state.player.read().buffered_playback {
-                if let Some(volume) = playback.volume {
-                    let volume = std::cmp::min(volume as i32 + offset, 100_i32);
-                    client_pub.send(ClientRequest::Player(PlayerRequest::Volume(volume as u8)))?;
-                }
-            }
+            let mut ui = state.ui.lock();
+            let base_u8 = ui
+                .volume_target
+                .or_else(|| {
+                    state
+                        .player
+                        .read()
+                        .buffered_playback
+                        .as_ref()
+                        .and_then(|p| p.volume.map(|v| v as u8))
+                })
+                .unwrap_or(0);
+            let base = i32::from(base_u8);
+            let new_volume = std::cmp::min(base + offset, 100_i32).max(0);
+            ui.volume_target = Some(new_volume as u8);
+            client_pub.send(ClientRequest::Player(PlayerRequest::Volume(
+                new_volume as u8,
+            )))?;
         }
         Command::Mute => {
             client_pub.send(ClientRequest::Player(PlayerRequest::ToggleMute))?;
