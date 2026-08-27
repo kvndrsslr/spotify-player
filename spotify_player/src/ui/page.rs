@@ -1463,11 +1463,13 @@ fn render_episode_detail_footer(
     let text_rect = {
         let configs = config::get_config();
         let image_url = episode.image_url.as_deref();
-        match image_url
-            .filter(|_| configs.app_config.layout.detail_window_image)
-            .and_then(|url| data.caches.images.get(url).map(|img| (url, img)))
-        {
-            Some((url, img)) => {
+        let image_fetch =
+            || image_url.and_then(|url| data.caches.images.get(url).map(|img| (url, img)));
+        match (
+            image_url.filter(|_| configs.app_config.layout.detail_window_image),
+            image_fetch(),
+        ) {
+            (_, Some((url, img))) => {
                 let width = {
                     let font = ui.picker.font_size();
                     inner.height.saturating_mul(font.height) / font.width.max(1)
@@ -1482,7 +1484,11 @@ fn render_episode_detail_footer(
                     .render(frame, &picker, "episode-detail", url, img, area);
                 chunks[1]
             }
-            None => inner,
+            (Some(url), None) => {
+                ui.note_missing_image(url);
+                inner
+            }
+            (None, _) => inner,
         }
     };
     #[cfg(not(feature = "image"))]

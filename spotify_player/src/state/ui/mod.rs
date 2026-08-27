@@ -35,6 +35,10 @@ pub struct UIState {
 
     /// Count prefix for vim-style navigation (e.g., 5j, 10k)
     pub count_prefix: Option<usize>,
+    /// Image urls the renderer requested but found missing from the data cache, with attempt
+    /// counts. Filled by render paths, drained by the client task for background refetches.
+    #[cfg(feature = "image")]
+    pub missing_images: Vec<(String, u8)>,
 
     #[cfg(feature = "image")]
     pub image_compositor: ImageCompositor,
@@ -114,11 +118,27 @@ impl Default for UIState {
             count_prefix: None,
 
             #[cfg(feature = "image")]
+            missing_images: Vec::new(),
+
+            #[cfg(feature = "image")]
             image_compositor: ImageCompositor::default(),
 
             // Will be reinitialize later in ui/mod.rs after init_ui()
             #[cfg(feature = "image")]
             picker: Picker::halfblocks(),
+        }
+    }
+}
+
+impl UIState {
+    /// Record a cache miss so the client task refetches this url; deduped per url.
+    #[cfg(feature = "image")]
+    pub fn note_missing_image(&mut self, url: &str) {
+        const MAX_PENDING: usize = 16;
+        if let Some(entry) = self.missing_images.iter_mut().find(|(u, _)| u == url) {
+            entry.1 = entry.1.saturating_add(1);
+        } else if self.missing_images.len() < MAX_PENDING {
+            self.missing_images.push((url.to_owned(), 0));
         }
     }
 }

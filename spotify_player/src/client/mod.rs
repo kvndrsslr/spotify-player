@@ -76,6 +76,11 @@ pub struct AppClient {
     /// Guards the post-change playback poll so rapid player events coalesce into a single
     /// in-flight loop rather than flooding Spotify's Web API (which 429 rate-limits).
     update_playback_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-url refetch bookkeeping for render-path image cache misses: attempts + next
+    /// eligible instant (exponential backoff).
+    #[cfg(feature = "image")]
+    image_retries:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, (u8, std::time::Instant)>>>,
 }
 
 impl Deref for AppClient {
@@ -270,6 +275,8 @@ impl AppClient {
             #[cfg(feature = "streaming")]
             stream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             update_playback_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "image")]
+            image_retries: Arc::new(parking_lot::Mutex::default()),
         })
     }
 
@@ -284,11 +291,7 @@ impl AppClient {
         playback_device: Option<&str>,
         volume_percent: u8,
     ) -> bool {
-        let Some(device) = playback_device else {
-            return false;
-        };
-        let session = self.spotify.session().await;
-        if session.is_invalid() || session.device_id() != device {
+        if !self.active_device_is_integrated(playback_device).await {
             return false;
         }
         match self.stream_conn.lock().as_ref() {
@@ -307,6 +310,17 @@ impl AppClient {
         }
     }
 
+    /// Whether the active playback device is this process' own integrated client with a live
+    /// session, meaning local librespot commands apply directly.
+    #[cfg(feature = "streaming")]
+    async fn active_device_is_integrated(&self, playback_device: Option<&str>) -> bool {
+        let Some(device) = playback_device else {
+            return false;
+        };
+        let session = self.spotify.session().await;
+        !session.is_invalid() && session.device_id() == device
+    }
+
     /// See [`Self::set_integrated_volume`]; without the streaming feature there is no
     /// integrated player, so every volume change targets the debounced remote path.
     #[cfg(not(feature = "streaming"))]
@@ -316,6 +330,85 @@ impl AppClient {
         _volume_percent: u8,
     ) -> bool {
         false
+    }
+
+    /// Seek the integrated player through librespot's local spirc when the active device is
+    /// our own; returns `false` so callers fall back to the Web API path.
+    #[cfg(feature = "streaming")]
+    async fn set_integrated_seek(
+        &self,
+        playback_device: Option<&str>,
+        position: chrono::Duration,
+    ) -> bool {
+        if !self.active_device_is_integrated(playback_device).await {
+            return false;
+        }
+        let position_ms = u32::try_from(position.num_milliseconds()).unwrap_or(u32::MAX);
+        match self.stream_conn.lock().as_ref() {
+            Some(spirc) => match spirc.set_position_ms(position_ms) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!("Failed to set integrated seek locally: {err:#}");
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    #[cfg(not(feature = "streaming"))]
+    async fn set_integrated_seek(
+        &self,
+        _playback_device: Option<&str>,
+        _position: chrono::Duration,
+    ) -> bool {
+        false
+    }
+    /// Refetch image urls that render paths reported missing, with per-url exponential
+    /// backoff; runs on playback polls and manual refreshes.
+    pub(crate) fn recover_missing_images(&self, state: &SharedState) {
+        let pending = {
+            let mut guard = state.ui.try_lock();
+            match guard.as_mut() {
+                Some(ui) => std::mem::take(&mut ui.missing_images),
+                None => return,
+            }
+        };
+
+        for (url, _) in pending {
+            let now = std::time::Instant::now();
+            let (attempts, due) = *self
+                .image_retries
+                .lock()
+                .entry(url.clone())
+                .or_insert((0u8, now));
+            if now < due {
+                continue;
+            }
+            let backoff = match attempts {
+                0 => std::time::Duration::from_secs(2),
+                1 => std::time::Duration::from_secs(5),
+                2 => std::time::Duration::from_secs(15),
+                _ => std::time::Duration::from_secs(45),
+            };
+            if let Some(entry) = self.image_retries.lock().get_mut(&url) {
+                *entry = ((attempts + 1).min(4), now + backoff);
+            }
+
+            let client = self.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                if let Err(err) = client.fetch_episode_image(&state, &url).await {
+                    tracing::warn!("Image refetch failed for {url}: {err:#}");
+                    // Requeue with an incremented attempt; the next drain honors backoff.
+                    if let Some(mut ui) = state.ui.try_lock() {
+                        ui.note_missing_image(&url);
+                    }
+                } else {
+                    client.image_retries.lock().remove(&url);
+                }
+            });
+        }
     }
 
     /// Snapshot the currently-playing context + track so a recreated session can
@@ -616,7 +709,12 @@ impl AppClient {
                 playback.is_playing = !playback.is_playing;
             }
             PlayerRequest::SeekTrack(position_ms) => {
-                self.seek_track(position_ms, device_id).await?;
+                if !self
+                    .set_integrated_seek(playback.device_id.as_deref(), position_ms)
+                    .await
+                {
+                    self.seek_track(position_ms, device_id).await?;
+                }
             }
             PlayerRequest::Repeat => {
                 let next_repeat_state = match playback.repeat_state {
@@ -749,6 +847,7 @@ impl AppClient {
             }
             ClientRequest::GetCurrentPlayback => {
                 self.retrieve_current_playback(state, true).await?;
+                self.recover_missing_images(state);
             }
             ClientRequest::GetDevices => {
                 #[allow(unused_mut)]

@@ -134,7 +134,6 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
             cli::start_socket(&client, Some(&state), None).await;
         }
     });
-
     // client event handler task
     tokio::task::spawn({
         let state = state.clone();
@@ -151,6 +150,21 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         let client = client.clone();
         async move {
             client::start_session_watcher(state, client).await;
+        }
+    });
+
+    #[cfg(feature = "image")]
+    // background task that refetches cover images the UI reported missing from cache
+    // (e.g. evicted while browsing long shows), with exponential backoff per url
+    tokio::task::spawn({
+        let client = client.clone();
+        let state = state.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                client.recover_missing_images(&state);
+            }
         }
     });
 

@@ -69,8 +69,10 @@ impl MemoryCaches {
             search: ttl_cache::TtlCache::new(64),
             lyrics: ttl_cache::TtlCache::new(64),
             genres: ttl_cache::TtlCache::new(64),
-            #[cfg(feature = "image")]
-            images: ttl_cache::TtlCache::new(64),
+            // Podcast shows routinely hold hundreds of uniquely-covered episodes; prefetching
+            // one show must not evict the currently displayed covers. Bounded for memory, but
+            // sized far above any realistic single-show list.
+            images: ttl_cache::TtlCache::new(256),
         }
     }
 }

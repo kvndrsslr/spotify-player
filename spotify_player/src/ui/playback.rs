@@ -86,6 +86,8 @@ pub fn render_playback_window(
                                 img,
                                 cover_img_rect,
                             );
+                        } else {
+                            ui.note_missing_image(&url);
                         }
                     }
                     (metadata_rect, progress_bar_rect)
