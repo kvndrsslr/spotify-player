@@ -627,7 +627,10 @@ fn handle_global_command(
             client_pub.send(ClientRequest::Player(PlayerRequest::Shuffle))?;
         }
         Command::VolumeChange { offset } => {
-            let mut ui = state.ui.lock();
+            // `ui` is the guard already held by `handle_key_event`; do NOT re-lock
+            // `state.ui` here — parking_lot mutexes are not re-entrant and this runs on
+            // the same thread (a second lock deadlocks the event thread, ui included).
+            let ui = &mut *ui;
             let base_u8 = ui
                 .volume_target
                 .or_else(|| {
