@@ -13,9 +13,15 @@ use crate::utils::map_join;
 
 use super::ClientRequest;
 
+/// Cooldown for the watcher's maintenance requests, so a persisting queue/playback
+/// mismatch (Web API lag) can never flood requests until Spotify rate-limits the whole
+/// app with 429s.
+const QUEUE_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+
 struct PlayerEventHandlerState {
     get_context_timer: Instant,
     last_playback_refresh_timer: Instant,
+    last_maintenance_request: Instant,
 }
 
 /// starts the client's request handler
@@ -72,6 +78,7 @@ pub async fn start_session_watcher(state: SharedState, client: super::AppClient)
 fn handle_playback_change_event(
     state: &SharedState,
     client_pub: &flume::Sender<ClientRequest>,
+    handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
     let player = state.player.read();
     let (playback, id, duration) = match (
@@ -90,23 +97,27 @@ fn handle_playback_change_event(
         ),
         _ => return Ok(()),
     };
-
+    let maintenance_ready =
+        handler_state.last_maintenance_request.elapsed() >= QUEUE_REFRESH_COOLDOWN;
     if let Some(progress) = player.playback_progress() {
         // update the playback when the current track ends
-        if progress >= duration && playback.is_playing {
+        if progress >= duration && playback.is_playing && maintenance_ready {
             client_pub.send(ClientRequest::GetCurrentPlayback)?;
+            handler_state.last_maintenance_request = Instant::now();
         }
     }
 
     if let Some(queue) = player.queue.as_ref() {
         // queue needs to be updated if its playing track is different from actual playback's playing track
         if let Some(queue_track) = queue.currently_playing.as_ref() {
-            if queue_track.id().expect("null track_id") != id {
+            if queue_track.id().expect("null track_id") != id && maintenance_ready {
                 client_pub.send(ClientRequest::GetCurrentUserQueue)?;
+                handler_state.last_maintenance_request = Instant::now();
             }
         }
-    } else {
+    } else if maintenance_ready {
         client_pub.send(ClientRequest::GetCurrentUserQueue)?;
+        handler_state.last_maintenance_request = Instant::now();
     }
 
     Ok(())
@@ -203,7 +214,8 @@ fn handle_player_event(
 ) -> anyhow::Result<()> {
     handle_page_change_event(state, client_pub, handler_state)
         .context("handle page change event")?;
-    handle_playback_change_event(state, client_pub).context("handle playback change event")?;
+    handle_playback_change_event(state, client_pub, handler_state)
+        .context("handle playback change event")?;
 
     Ok(())
 }
@@ -218,6 +230,7 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
     let mut handler_state = PlayerEventHandlerState {
         get_context_timer: Instant::now(),
         last_playback_refresh_timer: Instant::now(),
+        last_maintenance_request: Instant::now(),
     };
 
     loop {
