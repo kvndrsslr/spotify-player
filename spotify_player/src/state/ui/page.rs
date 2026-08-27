@@ -3,6 +3,7 @@ use crate::{
     ui::single_line_input::LineInput,
 };
 use ratatui::widgets::{ListState, TableState};
+use rspotify::model::Id;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PageState {
@@ -178,6 +179,20 @@ impl PageState {
     pub fn selected(&mut self) -> Option<usize> {
         self.focus_window_state_mut()
             .map(|state| state.selected())?
+    }
+
+    /// Like [`Self::selected`], but reads the underlying window cursor even while focus sits
+    /// on a non-cursor panel (the show page's description). Anything that *acts* on the
+    /// current item must use this — otherwise focus mode silently makes it act on row 0.
+    pub fn selected_ignoring_focus(&mut self) -> Option<usize> {
+        if let Self::Context {
+            state: Some(ContextPageUIState::Show { episode_table, .. }),
+            ..
+        } = self
+        {
+            return episode_table.selected();
+        }
+        self.selected()
     }
 
     /// The currently focused window state of the page.
@@ -392,9 +407,19 @@ impl Focusable for PageState {
             _ => {}
         }
 
-        // reset the list/table state of the focus window
-        if let Some(mut state) = self.focus_window_state_mut() {
-            state.select(0);
+        // reset the list/table state of the focus window. The show page's episode table is
+        // exempt: its cursor drives the description panel, so resetting it on every focus
+        // toggle destroys the inspection context (the cursor would snap back to episode 1).
+        if !matches!(
+            self,
+            Self::Context {
+                state: Some(ContextPageUIState::Show { .. }),
+                ..
+            }
+        ) {
+            if let Some(mut state) = self.focus_window_state_mut() {
+                state.select(0);
+            }
         }
     }
 
@@ -419,9 +444,18 @@ impl Focusable for PageState {
             _ => {}
         }
 
-        // reset the list/table state of the focus window
-        if let Some(mut state) = self.focus_window_state_mut() {
-            state.select(0);
+        // reset the list/table state of the focus window; the show page's episode table is
+        // exempt (see `next`).
+        if !matches!(
+            self,
+            Self::Context {
+                state: Some(ContextPageUIState::Show { .. }),
+                ..
+            }
+        ) {
+            if let Some(mut state) = self.focus_window_state_mut() {
+                state.select(0);
+            }
         }
     }
 }
@@ -476,3 +510,59 @@ impl_focusable!(
     [Shows, Episodes],
     [Episodes, Input]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::model::ShowId;
+    use rspotify::model::Id;
+
+    fn show_page(selected: usize) -> PageState {
+        let mut page = PageState::Context {
+            id: None,
+            context_page_type: ContextPageType::Browsing(ContextId::Show(
+                ShowId::from_id("1").expect("valid id").clone_static(),
+            )),
+            state: Some(ContextPageUIState::Show {
+                episode_table: TableState::default(),
+                focus: ShowFocusState::Episodes,
+                description_scroll: 0,
+            }),
+        };
+        page.select(selected);
+        page
+    }
+
+    #[test]
+    fn cursor_survives_full_focus_cycle() {
+        let mut page = show_page(5);
+
+        // Tab into the description panel and back out.
+        page.next(); // Episodes -> Details
+        assert_eq!(
+            page.selected(),
+            None,
+            "Details focus must not expose the table cursor for key routing"
+        );
+        assert_eq!(page.selected_ignoring_focus(), Some(5));
+        page.next(); // Details -> Episodes
+
+        assert_eq!(
+            page.selected(),
+            Some(5),
+            "cursor must survive the focus cycle"
+        );
+    }
+
+    #[test]
+    fn cursor_survives_inspection_and_back() {
+        let mut page = show_page(7);
+
+        page.next();
+        // While Details is focused, actions must still see the real cursor.
+        assert_eq!(page.selected_ignoring_focus(), Some(7));
+        page.previous();
+
+        assert_eq!(page.selected(), Some(7));
+    }
+}

@@ -1355,11 +1355,24 @@ fn render_episode_table(
         }
     }
 
-    let selected_index = if is_active && configs.app_config.enable_relative_line_number {
-        ui.current_page_mut().selected()
-    } else {
-        None
-    };
+    // The description panel follows this table's cursor even while the Details panel is
+    // focused, so the cursor must stay visible there (dimmed) rather than vanishing.
+    let details_focused = matches!(
+        ui.current_page(),
+        PageState::Context {
+            state: Some(ContextPageUIState::Show {
+                focus: ShowFocusState::Details,
+                ..
+            }),
+            ..
+        }
+    );
+    let selected_index =
+        if (is_active || details_focused) && configs.app_config.enable_relative_line_number {
+            ui.current_page_mut().selected()
+        } else {
+            None
+        };
 
     let n_episodes = episodes.len();
     let rows = episodes
@@ -1413,7 +1426,13 @@ fn render_episode_table(
         .style(ui.theme.table_header()),
     )
     .column_spacing(2)
-    .row_highlight_style(ui.theme.selection(is_active));
+    .row_highlight_style(if details_focused {
+        ui.theme
+            .selection(true)
+            .add_modifier(ratatui::style::Modifier::DIM)
+    } else {
+        ui.theme.selection(is_active)
+    });
 
     if let PageState::Context {
         state: Some(state), ..
@@ -1437,16 +1456,9 @@ fn render_episode_detail_footer(
     show: &Show,
     episodes: &[&Episode],
 ) {
-    // Read the cursor straight from the episode table: `PageState::selected()` returns None
-    // while the Details panel is focused (key-routing distinction), which must not make the
-    // description snap back to the first episode.
-    let selected = match ui.current_page_mut() {
-        PageState::Context {
-            state: Some(ContextPageUIState::Show { episode_table, .. }),
-            ..
-        } => episode_table.selected().unwrap_or(0),
-        _ => 0,
-    };
+    // selected_ignoring_focus: the description must follow the table cursor even while the
+    // Details panel is focused, where focus-dependent selected() would report None (row 0).
+    let selected = ui.current_page_mut().selected_ignoring_focus().unwrap_or(0);
     let Some(episode) = episodes.get(selected) else {
         return;
     };

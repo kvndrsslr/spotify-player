@@ -669,7 +669,12 @@ pub fn handle_command_for_episode_list_window(
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
-    let id = ui.current_page_mut().selected().unwrap_or_default();
+    // Focus-independent: while the description panel is focused, unconsumed commands fall
+    // through here and must act on the real cursor, not row 0.
+    let id = ui
+        .current_page_mut()
+        .selected_ignoring_focus()
+        .unwrap_or_default();
     if id >= episodes.len() {
         return Ok(false);
     }
