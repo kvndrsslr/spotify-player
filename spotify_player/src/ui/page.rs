@@ -1477,27 +1477,9 @@ fn render_episode_detail_footer(
                     .split(inner);
                 let area = chunks[0];
 
-                let needs_rebuild = {
-                    let info = &ui.episode_detail_image_render_info;
-                    info.url != url || info.render_area != area
-                };
-                if needs_rebuild {
-                    let state = match crate::ui::cover_image::CoverImage::new(&ui.picker, img, area)
-                    {
-                        Ok(cover) => Some(cover),
-                        Err(err) => {
-                            tracing::error!("Failed to encode episode cover image: {err:#}");
-                            None
-                        }
-                    };
-                    let info = &mut ui.episode_detail_image_render_info;
-                    info.state = state;
-                    url.clone_into(&mut info.url);
-                    info.render_area = area;
-                }
-                if let Some(cover) = ui.episode_detail_image_render_info.state.as_mut() {
-                    cover.render(frame, area);
-                }
+                let picker = ui.picker.clone();
+                ui.image_compositor
+                    .render(frame, &picker, "episode-detail", url, img, area);
                 chunks[1]
             }
             None => inner,

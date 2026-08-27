@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[cfg(feature = "image")]
-use crate::ui::cover_image::CoverImage;
+use crate::ui::image_compositor::ImageCompositor;
 #[cfg(feature = "image")]
 use ratatui_image::picker::Picker;
 
@@ -17,25 +17,6 @@ mod popup;
 
 pub use page::*;
 pub use popup::*;
-
-#[cfg(feature = "image")]
-#[derive(Default)]
-pub struct ImageRenderInfo {
-    pub url: String,
-    pub render_area: ratatui::layout::Rect,
-    pub state: Option<CoverImage>,
-}
-
-#[cfg(feature = "image")]
-impl std::fmt::Debug for ImageRenderInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImageRenderInfo")
-            .field("url", &self.url)
-            .field("render_area", &self.render_area)
-            .field("state", &self.state.is_some())
-            .finish()
-    }
-}
 
 /// Application's UI state
 #[derive(Debug)]
@@ -56,10 +37,7 @@ pub struct UIState {
     pub count_prefix: Option<usize>,
 
     #[cfg(feature = "image")]
-    pub last_cover_image_render_info: ImageRenderInfo,
-
-    #[cfg(feature = "image")]
-    pub episode_detail_image_render_info: ImageRenderInfo,
+    pub image_compositor: ImageCompositor,
 
     #[cfg(feature = "image")]
     pub picker: Picker,
@@ -136,10 +114,7 @@ impl Default for UIState {
             count_prefix: None,
 
             #[cfg(feature = "image")]
-            last_cover_image_render_info: ImageRenderInfo::default(),
-
-            #[cfg(feature = "image")]
-            episode_detail_image_render_info: ImageRenderInfo::default(),
+            image_compositor: ImageCompositor::default(),
 
             // Will be reinitialize later in ui/mod.rs after init_ui()
             #[cfg(feature = "image")]

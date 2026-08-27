@@ -3,8 +3,6 @@ use super::{
     Layout, Line, LineGauge, Modifier, Paragraph, PlaybackMetadata, Rect, SharedState, Span, Style,
     Text, UIStateGuard, Wrap,
 };
-#[cfg(feature = "image")]
-use crate::state::ImageRenderInfo;
 use crate::{
     state::Track,
     ui::utils::{format_genres, to_bidi_string},
@@ -79,30 +77,15 @@ pub fn render_playback_window(
                     if let Some(url) = url {
                         let data = state.data.read();
                         if let Some(img) = data.caches.images.get(&url) {
-                            if ui.last_cover_image_render_info.url != url
-                                || ui.last_cover_image_render_info.render_area != cover_img_rect
-                            {
-                                let state = match crate::ui::cover_image::CoverImage::new(
-                                    &ui.picker,
-                                    img,
-                                    cover_img_rect,
-                                ) {
-                                    Ok(cover) => Some(cover),
-                                    Err(err) => {
-                                        tracing::error!("Failed to encode cover image: {err:#}");
-                                        None
-                                    }
-                                };
-                                ui.last_cover_image_render_info = ImageRenderInfo {
-                                    url,
-                                    render_area: cover_img_rect,
-                                    state,
-                                };
-                            }
-                            let area = ui.last_cover_image_render_info.render_area;
-                            if let Some(cover) = ui.last_cover_image_render_info.state.as_mut() {
-                                cover.render(frame, area);
-                            }
+                            let picker = ui.picker.clone();
+                            ui.image_compositor.render(
+                                frame,
+                                &picker,
+                                "playback",
+                                &url,
+                                img,
+                                cover_img_rect,
+                            );
                         }
                     }
                     (metadata_rect, progress_bar_rect)
@@ -142,14 +125,6 @@ pub fn render_playback_window(
             return other_rect;
         }
     }
-
-    // Previously rendered image can result in a weird rendering text,
-    // clear the previous widget's area before rendering the text.
-    #[cfg(feature = "image")]
-    {
-        ui.last_cover_image_render_info = ImageRenderInfo::default();
-    }
-
     if player.playback_last_updated_time.is_none() {
         // Still waiting for the first successful playback fetch — show animated loading indicator
         const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

@@ -19,13 +19,10 @@ use ratatui::{
     Frame,
 };
 
-#[cfg(feature = "image")]
-use crate::state::ImageRenderInfo;
-
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 #[cfg(feature = "image")]
-pub mod cover_image;
+pub mod image_compositor;
 mod page;
 mod playback;
 mod popup;
@@ -39,7 +36,6 @@ pub fn run(state: &SharedState, mut terminal: Terminal) -> Result<()> {
     let ui_refresh_duration = std::time::Duration::from_millis(
         config::get_config().app_config.app_refresh_duration_in_ms,
     );
-    let mut last_terminal_size = None;
 
     loop {
         {
@@ -49,15 +45,9 @@ pub fn run(state: &SharedState, mut terminal: Terminal) -> Result<()> {
                 std::process::exit(0);
             }
 
-            let terminal_size = terminal.size()?;
-            if Some(terminal_size) != last_terminal_size {
-                last_terminal_size = Some(terminal_size);
-                #[cfg(feature = "image")]
-                {
-                    // redraw the cover image when the terminal's size changes
-                    ui.last_cover_image_render_info = ImageRenderInfo::default();
-                }
-            }
+            #[cfg(feature = "image")]
+            // Frame-skip detection: surfaces idle for a pass are healed on their next render.
+            ui.image_compositor.begin_frame();
 
             if let Err(err) = terminal.draw(|frame| {
                 // set the background and foreground colors for the application
