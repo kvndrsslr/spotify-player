@@ -23,6 +23,10 @@ pub struct PlayerState {
     /// Active when the integrated librespot player is streaming and the user
     /// started playback from a track-table context.
     pub custom_queue: Option<CustomQueue>,
+
+    /// Track/episode currently streamed by the local librespot player, as a Spotify URI.
+    /// Local truth that may briefly be ahead of the Web API's playback state.
+    pub streaming_track_id: Option<String>,
 }
 
 impl PlayerState {

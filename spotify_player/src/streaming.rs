@@ -274,13 +274,14 @@ pub async fn new_connection(
                     }
                     Ok(Some(event)) => {
                         tracing::info!("Got a new player event: {event:?}");
-                        match event {
-                            PlayerEvent::Playing { .. } => {
+                        match &event {
+                            PlayerEvent::Playing { playable_id, .. } => {
                                 let mut player = state.player.write();
+                                player.streaming_track_id = Some(playable_id.uri());
                                 if let Some(playback) = player.buffered_playback.as_mut() {
                                     playback.is_playing = true;
                                 }
-                                if let Some(ref bands) = state.vis_bands {
+                                if let Some(bands) = &state.vis_bands {
                                     bands.lock().is_active = true;
                                 }
                             }
@@ -289,11 +290,14 @@ pub async fn new_connection(
                                 if let Some(playback) = player.buffered_playback.as_mut() {
                                     playback.is_playing = false;
                                 }
-                                if let Some(ref bands) = state.vis_bands {
+                                if let Some(bands) = &state.vis_bands {
                                     bands.lock().is_active = false;
                                 }
                             }
-                            _ => {}
+                            PlayerEvent::Changed { playable_id } => {
+                                state.player.write().streaming_track_id = Some(playable_id.uri());
+                            }
+                            PlayerEvent::EndOfTrack { .. } => {}
                         }
                         client.update_playback(&state);
 

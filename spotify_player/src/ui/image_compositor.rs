@@ -34,11 +34,7 @@ use std::{
 use anyhow::{Context, Result};
 use base64::Engine;
 use image::DynamicImage;
-use ratatui::{
-    buffer::CellDiffOption,
-    layout::Rect,
-    Frame,
-};
+use ratatui::{buffer::CellDiffOption, layout::Rect, Frame};
 use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,

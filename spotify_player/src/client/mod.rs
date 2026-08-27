@@ -1149,11 +1149,11 @@ impl AppClient {
         let state = state.clone();
         let in_flight = self.update_playback_in_flight.clone();
         tokio::task::spawn(async move {
-            // Startup catch-up: the integrated player starts audio locally while Spotify's
-            // Web API still reports "no active playback" (device registration + eventual
-            // consistency). Keep polling at a 1s cadence until the state actually shows up,
-            // bounded so an idle connected session doesn't poll forever. With playback
-            // already visible, two fetches ~1s apart settle a change as before.
+            // Startup catch-up + track-change lag: the integrated player starts audio
+            // locally while Spotify's Web API still reports stale or empty playback
+            // (eventual consistency). Keep polling at a 1s cadence until the API reports
+            // the track the local stream is actually playing; bounded so nothing polls
+            // forever.
             let mut attempts = 0u32;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1168,12 +1168,56 @@ impl AppClient {
                     let player = state.player.read();
                     player.playback.is_some() && player.buffered_playback.is_some()
                 };
-                if (ready && attempts >= 2) || attempts >= 30 {
+                if ready && client.playback_matches_stream(&state).await && attempts >= 2 {
+                    break;
+                }
+                if attempts >= 30 {
                     break;
                 }
             }
             in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
         });
+    }
+
+    /// Whether the Web API's playback state has caught up to what the local librespot
+    /// stream reports as the currently played track. Always true for non-integrated
+    /// devices, where there is no local truth to compare against.
+    #[cfg(feature = "streaming")]
+    async fn playback_matches_stream(&self, state: &SharedState) -> bool {
+        let (playback, streaming_track_id) = {
+            let player = state.player.read();
+            (
+                player.playback.as_ref().map(|p| {
+                    (
+                        p.device.id.clone(),
+                        p.item
+                            .as_ref()
+                            .and_then(rspotify::model::PlayableItem::id)
+                            .map(|id| id.uri()),
+                    )
+                }),
+                player.streaming_track_id.clone(),
+            )
+        };
+
+        let Some((device_id, item_uri)) = playback else {
+            // no playback yet (startup): keep chasing
+            return false;
+        };
+        if !self.active_device_is_integrated(device_id.as_deref()).await {
+            return true;
+        }
+        match (item_uri, streaming_track_id) {
+            (_, None) => true,
+            (Some(item_uri), Some(track_uri)) => item_uri == track_uri,
+            (None, Some(_)) => false,
+        }
+    }
+
+    /// Without the streaming feature there is no local player, so nothing to wait for.
+    #[cfg(not(feature = "streaming"))]
+    async fn playback_matches_stream(&self, _state: &SharedState) -> bool {
+        true
     }
 
     /// Get Spotify's available browse categories
