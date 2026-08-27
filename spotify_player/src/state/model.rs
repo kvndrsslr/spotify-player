@@ -188,6 +188,10 @@ pub struct Show {
     pub id: ShowId<'static>,
     pub name: String,
     pub publisher: String,
+    /// Cover art url; populated when the show payload carries it (search results, show fetch).
+    #[cfg(feature = "image")]
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -602,6 +606,8 @@ impl From<rspotify::model::SimplifiedShow> for Show {
             id: show.id,
             name: show.name,
             publisher: show.publisher,
+            #[cfg(feature = "image")]
+            image_url: show.images.first().map(|i| i.url.clone()),
         }
     }
 }
@@ -612,6 +618,8 @@ impl From<rspotify::model::FullShow> for Show {
             id: show.id,
             name: show.name,
             publisher: show.publisher,
+            #[cfg(feature = "image")]
+            image_url: show.images.first().map(|i| i.url.clone()),
         }
     }
 }

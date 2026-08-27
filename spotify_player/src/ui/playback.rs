@@ -87,7 +87,7 @@ pub fn render_playback_window(
                                 cover_img_rect,
                             );
                         } else {
-                            ui.note_missing_image(&url);
+                            ui.queue_image_fetch(&url);
                         }
                     }
                     (metadata_rect, progress_bar_rect)

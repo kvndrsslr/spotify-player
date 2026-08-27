@@ -51,15 +51,48 @@ pub struct MemoryCaches {
     pub search: ttl_cache::TtlCache<String, SearchResults>,
     pub lyrics: ttl_cache::TtlCache<String, Option<Lyrics>>,
     pub genres: ttl_cache::TtlCache<String, Vec<String>>,
+    /// Album / show / artist artwork for the playback panel; modest cap — the playback
+    /// surface only ever needs one url at a time.
     #[cfg(feature = "image")]
     pub images: ttl_cache::TtlCache<String, image::DynamicImage>,
+    /// Episode cover ring buffer. Kept strictly separate from [`Self::images`] so scrolling
+    /// a long show can never evict displayed album/show art (or vice versa). Insertion moves
+    /// entries to the back, so eviction hits the least-recently-*touched* episode; the moving
+    /// prefetch window re-inserts near entries on every selection move, making an evicted
+    /// item always one that is far from the pointer. Cap >> window radius.
+    #[cfg(feature = "image")]
+    pub episode_images: EpisodeImageRing,
 }
 
-#[derive(Default, Debug)]
-/// Spotify browse data
-pub struct BrowseData {
-    pub categories: Vec<Category>,
-    pub category_playlists: HashMap<String, Vec<Playlist>>,
+/// Fixed-capacity LRU keyed by image url, storing small decoded covers.
+#[cfg(feature = "image")]
+#[derive(Default)]
+pub struct EpisodeImageRing {
+    buf: std::collections::VecDeque<(String, image::DynamicImage)>,
+}
+
+#[cfg(feature = "image")]
+impl EpisodeImageRing {
+    pub const CAP: usize = 64;
+
+    pub fn get(&self, url: &str) -> Option<&image::DynamicImage> {
+        self.buf.iter().find(|(u, _)| u == url).map(|(_, img)| img)
+    }
+
+    pub fn contains(&self, url: &str) -> bool {
+        self.buf.iter().any(|(u, _)| u == url)
+    }
+
+    /// Insert (or move to back), evicting the least-recently-touched entry when full.
+    pub fn insert(&mut self, url: String, img: image::DynamicImage) {
+        if let Some(pos) = self.buf.iter().position(|(u, _)| *u == url) {
+            self.buf.remove(pos);
+        }
+        while self.buf.len() >= Self::CAP {
+            self.buf.pop_front();
+        }
+        self.buf.push_back((url, img));
+    }
 }
 
 impl MemoryCaches {
@@ -69,12 +102,19 @@ impl MemoryCaches {
             search: ttl_cache::TtlCache::new(64),
             lyrics: ttl_cache::TtlCache::new(64),
             genres: ttl_cache::TtlCache::new(64),
-            // Podcast shows routinely hold hundreds of uniquely-covered episodes; prefetching
-            // one show must not evict the currently displayed covers. Bounded for memory, but
-            // sized far above any realistic single-show list.
-            images: ttl_cache::TtlCache::new(256),
+            #[cfg(feature = "image")]
+            images: ttl_cache::TtlCache::new(64),
+            #[cfg(feature = "image")]
+            episode_images: EpisodeImageRing::default(),
         }
     }
+}
+
+#[derive(Default, Debug)]
+/// Spotify browse data
+pub struct BrowseData {
+    pub categories: Vec<Category>,
+    pub category_playlists: HashMap<String, Vec<Playlist>>,
 }
 
 impl AppData {

@@ -35,10 +35,15 @@ pub struct UIState {
 
     /// Count prefix for vim-style navigation (e.g., 5j, 10k)
     pub count_prefix: Option<usize>,
-    /// Image urls the renderer requested but found missing from the data cache, with attempt
-    /// counts. Filled by render paths, drained by the client task for background refetches.
+    /// Image urls awaiting a background fetch, with retry attempt counts. Render paths enqueue
+    /// cache misses here plus the moving prefetch window around the selected episode; the
+    /// client task drains them.
     #[cfg(feature = "image")]
-    pub missing_images: Vec<(String, u8)>,
+    pub image_fetch_queue: Vec<(String, u8)>,
+    /// Endpoints of the last enqueued episode-image window, used to detect selection moves
+    /// without re-enqueueing every frame.
+    #[cfg(feature = "image")]
+    pub image_window_signature: Option<(String, String)>,
 
     #[cfg(feature = "image")]
     pub image_compositor: ImageCompositor,
@@ -118,7 +123,9 @@ impl Default for UIState {
             count_prefix: None,
 
             #[cfg(feature = "image")]
-            missing_images: Vec::new(),
+            image_fetch_queue: Vec::new(),
+            #[cfg(feature = "image")]
+            image_window_signature: None,
 
             #[cfg(feature = "image")]
             image_compositor: ImageCompositor::default(),
@@ -131,14 +138,14 @@ impl Default for UIState {
 }
 
 impl UIState {
-    /// Record a cache miss so the client task refetches this url; deduped per url.
+    /// Queue an image url for background fetching; retried url bumps its attempt count.
     #[cfg(feature = "image")]
-    pub fn note_missing_image(&mut self, url: &str) {
-        const MAX_PENDING: usize = 16;
-        if let Some(entry) = self.missing_images.iter_mut().find(|(u, _)| u == url) {
+    pub fn queue_image_fetch(&mut self, url: &str) {
+        const MAX_PENDING: usize = 32;
+        if let Some(entry) = self.image_fetch_queue.iter_mut().find(|(u, _)| u == url) {
             entry.1 = entry.1.saturating_add(1);
-        } else if self.missing_images.len() < MAX_PENDING {
-            self.missing_images.push((url.to_owned(), 0));
+        } else if self.image_fetch_queue.len() < MAX_PENDING {
+            self.image_fetch_queue.push((url.to_owned(), 0));
         }
     }
 }

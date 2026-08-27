@@ -1457,38 +1457,64 @@ fn render_episode_detail_footer(
 
     let inner = construct_and_render_block("Description", &ui.theme, Borders::ALL, frame, rect);
 
-    // When enabled and the episode's cover image is cached, reserve a left strip for it and
-    // render the description text in the remaining area.
+    // Episode cover art: prefer the episode's own image, falling back to the show's artwork
+    // (one url per show, usually already cached by the playback panel) so the footer never
+    // sits empty while episode art loads. The compositor swaps show→episode seamlessly once
+    // the real image arrives.
     #[cfg(feature = "image")]
     let text_rect = {
+        const WINDOW_RADIUS: usize = 12;
         let configs = config::get_config();
-        let image_url = episode.image_url.as_deref();
-        let image_fetch =
-            || image_url.and_then(|url| data.caches.images.get(url).map(|img| (url, img)));
-        match (
-            image_url.filter(|_| configs.app_config.layout.detail_window_image),
-            image_fetch(),
-        ) {
-            (_, Some((url, img))) => {
-                let width = {
-                    let font = ui.picker.font_size();
-                    inner.height.saturating_mul(font.height) / font.width.max(1)
-                };
-                let chunks = Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)])
-                    .spacing(1)
-                    .split(inner);
-                let area = chunks[0];
 
+        // Moving prefetch window around the selection so fast scrolling is always covered
+        // without eagerly loading every cover of a 500-episode podcast.
+        let first = selected.saturating_sub(WINDOW_RADIUS);
+        let last = (selected + WINDOW_RADIUS).min(episodes.len().saturating_sub(1));
+        let sig_first = episodes.first().map(|e| e.id.uri()).unwrap_or_default();
+        let sig_last = episodes.last().map(|e| e.id.uri()).unwrap_or_default();
+        if ui.image_window_signature.as_ref() != Some(&(sig_first.clone(), sig_last.clone())) {
+            ui.image_window_signature = Some((sig_first, sig_last));
+            for ep in episodes.iter().take(last + 1).skip(first) {
+                if let Some(url) = ep.image_url.as_deref() {
+                    ui.queue_image_fetch(url);
+                }
+            }
+        }
+
+        if configs.app_config.layout.detail_window_image && inner.width > 2 && inner.height > 2 {
+            let width = {
+                let font = ui.picker.font_size();
+                inner.height.saturating_mul(font.height) / font.width.max(1)
+            };
+            let chunks = Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)])
+                .spacing(1)
+                .split(inner);
+            let area = chunks[0];
+
+            let episode_img = episode
+                .image_url
+                .as_deref()
+                .and_then(|url| data.caches.episode_images.get(url).map(|img| (url, img)));
+            let show_img = show
+                .image_url
+                .as_deref()
+                .and_then(|url| data.caches.images.get(url).map(|img| (url, img)));
+
+            if let Some((url, img)) = episode_img.or(show_img) {
                 let picker = ui.picker.clone();
                 ui.image_compositor
                     .render(frame, &picker, "episode-detail", url, img, area);
-                chunks[1]
+            } else {
+                if let Some(url) = episode.image_url.as_deref() {
+                    ui.queue_image_fetch(url);
+                }
+                if let Some(url) = show.image_url.as_deref() {
+                    ui.queue_image_fetch(url);
+                }
             }
-            (Some(url), None) => {
-                ui.note_missing_image(url);
-                inner
-            }
-            (None, _) => inner,
+            chunks[1]
+        } else {
+            inner
         }
     };
     #[cfg(not(feature = "image"))]

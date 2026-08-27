@@ -174,6 +174,10 @@ struct ShowInfo {
     name: String,
     #[serde(default)]
     publisher: String,
+    #[cfg(feature = "image")]
+    /// Cover art, carried so the episode footer can fall back to show artwork.
+    #[serde(default)]
+    images: Vec<EpisodeImageInfo>,
 }
 
 /// A saved show object returned by `/me/shows`.
@@ -189,6 +193,9 @@ struct FullShow {
     name: String,
     #[serde(default)]
     publisher: String,
+    #[cfg(feature = "image")]
+    #[serde(default)]
+    images: Vec<EpisodeImageInfo>,
     episodes: rspotify::model::Page<SimplifiedEpisodeInfo>,
 }
 
@@ -370,12 +377,19 @@ impl AppClient {
         let pending = {
             let mut guard = state.ui.try_lock();
             match guard.as_mut() {
-                Some(ui) => std::mem::take(&mut ui.missing_images),
+                Some(ui) => std::mem::take(&mut ui.image_fetch_queue),
                 None => return,
             }
         };
 
         for (url, _) in pending {
+            // Skip urls that are already satisfied — window prefetch spam and successful
+            // concurrent fetches both land here.
+            if state.data.read().caches.episode_images.contains(&url) {
+                self.image_retries.lock().remove(&url);
+                continue;
+            }
+
             let now = std::time::Instant::now();
             let (attempts, due) = *self
                 .image_retries
@@ -402,7 +416,7 @@ impl AppClient {
                     tracing::warn!("Image refetch failed for {url}: {err:#}");
                     // Requeue with an incremented attempt; the next drain honors backoff.
                     if let Some(mut ui) = state.ui.try_lock() {
-                        ui.note_missing_image(&url);
+                        ui.queue_image_fetch(&url);
                     }
                 } else {
                     client.image_retries.lock().remove(&url);
@@ -976,8 +990,6 @@ impl AppClient {
                                         *total_episodes,
                                     );
                                 }
-                                #[cfg(feature = "image")]
-                                self.spawn_episode_images_prefetch(state.clone(), episodes.clone());
                             }
                             ctx
                         }
@@ -1368,6 +1380,8 @@ impl AppClient {
                 id: s.show.id,
                 name: s.show.name,
                 publisher: s.show.publisher,
+                #[cfg(feature = "image")]
+                image_url: s.show.images.first().map(|i| i.url.clone()),
             })
             .collect())
     }
@@ -1573,16 +1587,9 @@ impl AppClient {
         let result = self
             .http_get::<ShowSearchResult>(
                 &format!("{SPOTIFY_API_ENDPOINT}/search"),
-                &Query::from([
-                    ("q", query),
-                    ("type", "show"),
-                    ("market", "from_token"),
-                    ("limit", "50"),
-                    ("offset", "0"),
-                ]),
+                &Query::from([("q", query), ("type", "show"), ("market", "from_token")]),
             )
-            .await?;
-        Ok(result
+            .await?
             .shows
             .items
             .into_iter()
@@ -1590,8 +1597,12 @@ impl AppClient {
                 id: s.id,
                 name: s.name,
                 publisher: s.publisher,
+                #[cfg(feature = "image")]
+                image_url: s.images.first().map(|i| i.url.clone()),
             })
-            .collect())
+            .collect::<Vec<Show>>();
+
+        Ok(result)
     }
 
     /// Add a playable item to a playlist
@@ -1966,8 +1977,9 @@ impl AppClient {
             id: show.id,
             name: show.name,
             publisher: show.publisher,
+            #[cfg(feature = "image")]
+            image_url: show.images.first().map(|i| i.url.clone()),
         };
-
         Ok(Context::Show {
             show,
             episodes,
@@ -2028,19 +2040,12 @@ impl AppClient {
                             break;
                         }
                         offset += episodes.len();
-                        #[cfg(feature = "image")]
-                        let fetched = episodes.clone();
                         let mut data = state.data.write();
                         if let Some(Context::Show {
                             episodes: loaded, ..
                         }) = data.caches.context.get_mut(&uri)
                         {
                             loaded.extend(episodes);
-                        }
-                        drop(data);
-                        #[cfg(feature = "image")]
-                        if !fetched.is_empty() {
-                            client.spawn_episode_images_prefetch(state.clone(), fetched);
                         }
                     }
                     Err(err) => {
@@ -2052,10 +2057,15 @@ impl AppClient {
         });
     }
 
-    /// Fetch a cover image and cache it in memory (and on disk, when enabled).
+    /// Fetch an episode cover into the episode ring buffer (and the disk file cache when
+    /// enabled). The in-memory copy is downscaled to a display-sized budget — full-resolution
+    /// originals stay on disk only, keeping TUI memory footprint small.
     #[cfg(feature = "image")]
     async fn fetch_episode_image(&self, state: &SharedState, url: &str) -> Result<()> {
-        if state.data.read().caches.images.contains_key(url) {
+        // Downscale once: the largest render target is the episode footer strip (~15x8 cells),
+        // so a 192px cap is beyond sufficient and shrinks each entry ~50x versus full-size.
+        const MAX_DIMENSION: u32 = 192;
+        if state.data.read().caches.episode_images.contains(url) {
             return Ok(());
         }
 
@@ -2069,45 +2079,28 @@ impl AppClient {
             .retrieve_image(url, &path, configs.app_config.enable_cover_image_cache)
             .await?;
 
-        #[cfg(not(feature = "pixelate"))]
-        let image = image::load_from_memory(&bytes).context("Failed to load image from memory")?;
-        #[cfg(feature = "pixelate")]
+        #[allow(unused_mut)]
         let mut image =
             image::load_from_memory(&bytes).context("Failed to load image from memory")?;
         #[cfg(feature = "pixelate")]
         Self::pixelate_image(&mut image);
 
+        if image.width() > MAX_DIMENSION || image.height() > MAX_DIMENSION {
+            image = image.resize(
+                MAX_DIMENSION,
+                MAX_DIMENSION,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+
         state
             .data
             .write()
             .caches
-            .images
-            .insert(url.to_owned(), image, *TTL_CACHE_DURATION);
+            .episode_images
+            .insert(url.to_owned(), image);
         Ok(())
     }
-
-    /// Spawn a background task that prefetches and caches cover images for the given episodes'
-    /// unique image URLs, skipping any already cached.
-    #[cfg(feature = "image")]
-    fn spawn_episode_images_prefetch(&self, state: SharedState, episodes: Vec<Episode>) {
-        let client = self.clone();
-        tokio::spawn(async move {
-            if config::get_config().app_config.layout.detail_window_image {
-                let mut urls: Vec<&str> = episodes
-                    .iter()
-                    .filter_map(|e| e.image_url.as_deref())
-                    .collect();
-                urls.sort_unstable();
-                urls.dedup();
-                for url in urls {
-                    if let Err(err) = client.fetch_episode_image(&state, url).await {
-                        tracing::warn!("failed to prefetch episode image: {err:#}");
-                    }
-                }
-            }
-        });
-    }
-
     /// Make a GET HTTP request to the Spotify server
     async fn http_get<T>(&self, url: &str, payload: &Query<'_>) -> Result<T>
     where
