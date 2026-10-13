@@ -225,6 +225,8 @@ By default, `spotify_player` uses [ncspot](https://github.com/hrkfdn/ncspot)'s c
 >
 > The recommended setup is to **leave `client_id` unset** so the bundled default is used.
 
+To limit how often that quota is hit, requests are paced client-side: `spotify_player` throttles Web API traffic, and when the API does return `429 Too Many Requests`, all Web API traffic pauses for the server's `Retry-After` interval instead of each request retrying on its own. Album, playlist, artist, and show data is additionally cached on disk under `<cache folder>/context/` and revalidated in the background, so revisiting a page paints instantly from the cache while fresh data loads.
+
 ### Using a custom client ID
 
 A custom client ID is only worthwhile if you have a specific reason — for example an application that has been granted extended quota mode by Spotify, or organizational policy requiring your own registered app.

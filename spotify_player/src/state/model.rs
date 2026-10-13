@@ -17,7 +17,7 @@ pub trait BidiDisplay: Display {
     }
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 /// A Spotify context (playlist, album, artist)
 pub enum Context {
@@ -187,6 +187,9 @@ pub struct Playlist {
 pub struct Show {
     pub id: ShowId<'static>,
     pub name: String,
+    /// Missing in cache files written before this field existed, so tolerate its absence
+    /// instead of failing to load the whole saved-shows list.
+    #[serde(default)]
     pub publisher: String,
     /// Cover art url; populated when the show payload carries it (search results, show fetch).
     #[cfg(feature = "image")]
@@ -244,6 +247,12 @@ pub struct Category {
 }
 
 impl Context {
+    /// Whether the cached data is known to be incomplete (a show whose episode list is only
+    /// partially loaded), which must not be served without refreshing.
+    pub fn is_incomplete(&self) -> bool {
+        matches!(self, Context::Show { episodes, total_episodes, .. } if episodes.len() < *total_episodes)
+    }
+
     /// gets the context's description
     pub fn description(&self) -> String {
         match self {
@@ -785,5 +794,31 @@ impl From<librespot_metadata::lyrics::Lyrics> for Lyrics {
             .collect::<Vec<_>>();
         lines.sort_by_key(|l| l.0);
         Self { lines }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn show_without_publisher_deserializes() {
+        // Cache files written before `publisher` existed (e.g. by an older build) must still
+        // load instead of discarding the whole saved-shows list.
+        let show: Show = serde_json::from_str(r#"{"id":"abc","name":"My Show"}"#).unwrap();
+        assert_eq!(show.name, "My Show");
+        assert_eq!(show.publisher, "");
+    }
+
+    #[test]
+    fn show_with_publisher_round_trips() {
+        let json = r#"{"id":"abc","name":"My Show","publisher":"Pub"}"#;
+        let show: Show = serde_json::from_str(json).unwrap();
+        assert_eq!(show.publisher, "Pub");
+
+        let round_tripped: Show = serde_json::from_str(&serde_json::to_string(&show).unwrap())
+            .expect("re-serialized show deserializes");
+        assert_eq!(round_tripped.name, "My Show");
+        assert_eq!(round_tripped.publisher, "Pub");
     }
 }

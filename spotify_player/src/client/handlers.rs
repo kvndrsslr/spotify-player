@@ -143,7 +143,11 @@ fn handle_page_change_event(
                 false
             } else {
                 // update the context state and request new data when moving to a new context page
-                tracing::info!("Current context ID ({:?}) is different from the expected ID ({:?}), update the context state", id, expected_id);
+                tracing::info!(
+                    "Current context ID ({:?}) is different from the expected ID ({:?}), update the context state",
+                    id,
+                    expected_id
+                );
 
                 *id = expected_id;
 
@@ -190,7 +194,10 @@ fn handle_page_change_event(
             {
                 if current_track.name != *track {
                     if let Some(id) = &current_track.id {
-                        tracing::info!("Currently playing track \"{}\" is different from the track \"{track}\" shown up in the lyrics page. Fetching new track's lyrics...", current_track.name);
+                        tracing::info!(
+                            "Currently playing track \"{}\" is different from the track \"{track}\" shown up in the lyrics page. Fetching new track's lyrics...",
+                            current_track.name
+                        );
                         track.clone_from(&current_track.name);
                         *artists = map_join(&current_track.artists, |a| &a.name, ", ");
                         *track_uri = id.uri();

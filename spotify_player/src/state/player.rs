@@ -26,6 +26,8 @@ pub struct PlayerState {
 
     /// Track/episode currently streamed by the local librespot player, as a Spotify URI.
     /// Local truth that may briefly be ahead of the Web API's playback state.
+    // Only read/written by streaming-gated code (`streaming.rs`, `playback_matches_stream`).
+    #[cfg(feature = "streaming")]
     pub streaming_track_id: Option<String>,
 }
 

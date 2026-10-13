@@ -65,6 +65,11 @@ futures = "0.3.33"
 vergen = "=9.0.6"
 ratatui-image = { version = "11.0.6", optional = true, default-features = false, features = ["crossterm"] }
 
+[dev-dependencies]
+# `test-util` provides the paused clock used by the `rate_limit` unit tests. Kept out of the
+# main dependency set so release builds and the lockfile are unchanged.
+tokio = { version = "1.53.0", features = ["test-util"] }
+
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies.winit]
 version = "0.30.13"
 optional = true

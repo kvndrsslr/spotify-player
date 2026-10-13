@@ -1,7 +1,10 @@
 use std::io::{BufReader, BufWriter};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use super::model::{
@@ -282,5 +285,159 @@ where
         }
     } else {
         None
+    }
+}
+
+/// Current wall-clock time in milliseconds since the UNIX epoch, saturating to 0.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Path of the on-disk cache entry for a context URI: `<cache>/context/<uri sanitized>.json`.
+fn context_cache_path(cache_folder: &Path, uri: &str) -> PathBuf {
+    cache_folder
+        .join("context")
+        .join(format!("{}.json", uri.replace([':', '/'], "-")))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CachedContext {
+    pub fetched_at_ms: u64,
+    pub context: Context,
+}
+
+impl CachedContext {
+    /// Whether this entry is still within [`TTL_CACHE_DURATION`].
+    pub fn is_fresh(&self) -> bool {
+        now_ms().saturating_sub(self.fetched_at_ms) < TTL_CACHE_DURATION.as_millis() as u64
+    }
+}
+
+/// Write a context to the on-disk cache under `<cache>/context/`, one file per URI.
+pub fn store_context_in_file_cache(
+    cache_folder: &Path,
+    uri: &str,
+    context: &Context,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(cache_folder.join("context"))?;
+    let path = context_cache_path(cache_folder, uri);
+    let cached = CachedContext {
+        fetched_at_ms: now_ms(),
+        context: context.clone(),
+    };
+    let f = BufWriter::new(std::fs::File::create(path)?);
+    serde_json::to_writer(f, &cached)?;
+    Ok(())
+}
+
+/// Read a context from the on-disk cache; `None` when the file is missing or unparsable.
+pub fn load_context_from_file_cache(cache_folder: &Path, uri: &str) -> Option<CachedContext> {
+    let path = context_cache_path(cache_folder, uri);
+    if path.exists() {
+        let f = BufReader::new(std::fs::File::open(path).ok()?);
+        match serde_json::from_reader(f) {
+            Ok(data) => Some(data),
+            Err(err) => {
+                tracing::warn!("Failed to load context {uri} from the file cache: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::model::{AlbumId, ArtistId, PlaylistId, TrackId, UserId};
+
+    /// A scratch directory unique to this process and test, removed at creation to start clean.
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify-player-context-cache-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn sample_context() -> Context {
+        Context::Playlist {
+            playlist: Playlist {
+                id: PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M").expect("valid playlist id"),
+                collaborative: false,
+                name: "Daily Mix".to_string(),
+                owner: (
+                    "me".to_string(),
+                    UserId::from_id("spotify").expect("valid user id"),
+                ),
+                desc: "A test playlist".to_string(),
+                current_folder_id: 0,
+                snapshot_id: "snap123".to_string(),
+            },
+            tracks: vec![Track {
+                id: TrackId::from_id("1eX57c7iU9Q2b0t6s0kJ2vW").expect("valid track id"),
+                name: "Some Song".to_string(),
+                artists: vec![Artist {
+                    id: ArtistId::from_id("0hXJ7TZ9a5p0MZf2s2X1vJ").expect("valid artist id"),
+                    name: "Some Artist".to_string(),
+                }],
+                album: Some(Album {
+                    id: AlbumId::from_id("4aawyAB9vmqN3uQ7FjRGTy").expect("valid album id"),
+                    release_date: "2024-01-01".to_string(),
+                    name: "Some Album".to_string(),
+                    artists: vec![],
+                    typ: None,
+                    added_at: 0,
+                }),
+                duration: std::time::Duration::from_secs(180),
+                explicit: false,
+                added_at: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn context_round_trips_through_file_cache() {
+        let dir = unique_temp_dir("roundtrip");
+        let uri = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        let ctx = sample_context();
+
+        store_context_in_file_cache(&dir, uri, &ctx).expect("store should succeed");
+        let cached = load_context_from_file_cache(&dir, uri).expect("load should succeed");
+
+        assert!(cached.is_fresh(), "a freshly stored entry must be fresh");
+        assert_eq!(
+            serde_json::to_value(&cached.context).expect("serialize loaded context"),
+            serde_json::to_value(&ctx).expect("serialize original context"),
+            "context must survive the file-cache round trip unchanged"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn missing_or_truncated_context_file_yields_none() {
+        let dir = unique_temp_dir("truncated");
+        let uri = "spotify:album:4aawyAB9vmqN3uQ7FjRGTy";
+        let path = context_cache_path(&dir, uri);
+
+        // No file yet: must be a cache miss, not an error.
+        assert!(load_context_from_file_cache(&dir, uri).is_none());
+
+        // Garbage / truncated JSON must also yield None rather than panic.
+        std::fs::create_dir_all(path.parent().expect("cache path has a parent"))
+            .expect("create cache dir");
+        std::fs::write(
+            &path,
+            b"{ \"fetched_at_ms\": 123, \"context\": { \"tracks\": [ ",
+        )
+        .expect("write truncated file");
+        assert!(load_context_from_file_cache(&dir, uri).is_none());
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 }

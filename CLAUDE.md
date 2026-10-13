@@ -21,6 +21,7 @@ This file guides Claude Code when working in this repository.
 | `client/mod.rs`               | `AppClient`: Spotify API calls, session management                          |
 | `client/request.rs`           | `ClientRequest` / `PlayerRequest` enums (async message types)               |
 | `client/handlers.rs`          | Tokio task: receives `ClientRequest`, dispatches API calls                  |
+| `client/rate_limit.rs`        | Web API request pacing and the client-wide rate-limit cooldown              |
 | `config/mod.rs`               | `Configs` loaded once into a `OnceLock`; read via `config::get_config()`    |
 | `config/keymap.rs`            | Default keybindings and key sequence lookup                                 |
 | `config/theme.rs`             | Theme definitions and style resolution                                      |

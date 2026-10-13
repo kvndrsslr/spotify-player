@@ -1,5 +1,5 @@
 use crate::{
-    state::model::{Category, ContextId},
+    state::model::{Category, Context, ContextId},
     ui::single_line_input::LineInput,
 };
 use ratatui::widgets::{ListState, TableState};
@@ -192,6 +192,63 @@ impl PageState {
             return episode_table.selected();
         }
         self.selected()
+    }
+
+    /// Clamp every cursor of the context page into the bounds of `ctx`, so a background
+    /// refresh that shrinks a list can never leave a cursor pointing past its end.
+    /// Non-context pages and variants that do not match `ctx` are a no-op.
+    pub fn clamp_context_selection(&mut self, ctx: &Context) {
+        let Self::Context {
+            state: Some(state), ..
+        } = self
+        else {
+            return;
+        };
+        let clamp = Self::clamp_cursor;
+        match (state, ctx) {
+            (ContextPageUIState::Playlist { track_table }, Context::Playlist { tracks, .. })
+            | (ContextPageUIState::Album { track_table }, Context::Album { tracks, .. })
+            | (ContextPageUIState::Tracks { track_table }, Context::Tracks { tracks, .. }) => {
+                track_table.select(clamp(track_table.selected(), tracks.len()));
+            }
+            (ContextPageUIState::Show { episode_table, .. }, Context::Show { episodes, .. }) => {
+                episode_table.select(clamp(episode_table.selected(), episodes.len()));
+            }
+            (
+                ContextPageUIState::Artist {
+                    top_track_table,
+                    album_table,
+                    related_artist_list,
+                    ..
+                },
+                Context::Artist {
+                    top_tracks,
+                    albums,
+                    related_artists,
+                    ..
+                },
+            ) => {
+                top_track_table.select(clamp(top_track_table.selected(), top_tracks.len()));
+                album_table.select(clamp(album_table.selected(), albums.len()));
+                related_artist_list
+                    .select(clamp(related_artist_list.selected(), related_artists.len()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Clamp a `TableState`/`ListState` cursor so it cannot point past the end of its list.
+    fn clamp_cursor(selected: Option<usize>, len: usize) -> Option<usize> {
+        match selected {
+            Some(selected) if selected >= len => {
+                if len == 0 {
+                    None
+                } else {
+                    Some(len - 1)
+                }
+            }
+            selected => selected,
+        }
     }
 
     /// The currently focused window state of the page.
@@ -513,7 +570,10 @@ impl_focusable!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::model::ShowId;
+    use crate::state::model::{
+        Album, AlbumId, Artist, ArtistId, Episode, EpisodeId, Playlist, PlaylistId, Show, ShowId,
+        Track, TrackId, UserId,
+    };
     use rspotify::model::Id;
 
     fn show_page(selected: usize) -> PageState {
@@ -530,6 +590,82 @@ mod tests {
         };
         page.select(selected);
         page
+    }
+
+    fn track(id: &str) -> Track {
+        Track {
+            id: TrackId::from_id(id).expect("valid id").clone_static(),
+            name: id.to_owned(),
+            artists: vec![],
+            album: None,
+            duration: std::time::Duration::from_secs(1),
+            explicit: false,
+            added_at: 0,
+        }
+    }
+
+    fn album(id: &str) -> Album {
+        Album {
+            id: AlbumId::from_id(id).expect("valid id").clone_static(),
+            release_date: String::new(),
+            name: id.to_owned(),
+            artists: vec![],
+            typ: None,
+            added_at: 0,
+        }
+    }
+
+    fn artist(id: &str) -> Artist {
+        Artist {
+            id: ArtistId::from_id(id).expect("valid id").clone_static(),
+            name: id.to_owned(),
+        }
+    }
+
+    fn playlist(id: &str) -> Playlist {
+        Playlist {
+            id: PlaylistId::from_id(id).expect("valid id").clone_static(),
+            collaborative: false,
+            name: id.to_owned(),
+            owner: (
+                String::new(),
+                UserId::from_id("u1").expect("valid id").clone_static(),
+            ),
+            desc: String::new(),
+            current_folder_id: 0,
+            snapshot_id: String::new(),
+        }
+    }
+
+    fn show(id: &str) -> Show {
+        Show {
+            id: ShowId::from_id(id).expect("valid id").clone_static(),
+            name: id.to_owned(),
+            publisher: String::new(),
+            #[cfg(feature = "image")]
+            image_url: None,
+        }
+    }
+
+    fn episode(id: &str) -> Episode {
+        Episode {
+            id: EpisodeId::from_id(id).expect("valid id").clone_static(),
+            name: id.to_owned(),
+            description: String::new(),
+            duration: std::time::Duration::from_secs(1),
+            show: None,
+            release_date: String::new(),
+            #[cfg(feature = "image")]
+            image_url: None,
+        }
+    }
+
+    fn context_page(state: ContextPageUIState) -> PageState {
+        PageState::Context {
+            id: None,
+            context_page_type: ContextPageType::CurrentPlaying,
+            state: Some(state),
+        }
     }
 
     #[test]
@@ -563,5 +699,191 @@ mod tests {
         page.previous();
 
         assert_eq!(page.selected(), Some(7));
+    }
+
+    #[test]
+    fn show_cursor_clamped_to_shorter_context() {
+        let mut page = show_page(24);
+
+        page.clamp_context_selection(&Context::Show {
+            show: show("s1"),
+            episodes: vec![episode("e1"), episode("e2"), episode("e3")],
+            total_episodes: 3,
+        });
+
+        assert_eq!(
+            page.selected(),
+            Some(2),
+            "a cursor past the end must clamp to the last episode"
+        );
+    }
+
+    #[test]
+    fn show_cursor_clamped_to_empty_context() {
+        let mut page = show_page(24);
+
+        page.clamp_context_selection(&Context::Show {
+            show: show("s1"),
+            episodes: vec![],
+            total_episodes: 0,
+        });
+
+        assert_eq!(
+            page.selected(),
+            None,
+            "an empty context must clear the cursor, not leave a stale index"
+        );
+    }
+
+    #[test]
+    fn playlist_cursor_clamped_to_context() {
+        let mut page = context_page(ContextPageUIState::Playlist {
+            track_table: TableState::default(),
+        });
+        page.select(10);
+
+        page.clamp_context_selection(&Context::Playlist {
+            playlist: playlist("p1"),
+            tracks: vec![track("t1"), track("t2")],
+        });
+
+        assert_eq!(
+            page.selected(),
+            Some(1),
+            "cursor must clamp to tracks.len() - 1"
+        );
+    }
+
+    #[test]
+    fn in_bounds_cursor_and_none_untouched() {
+        // A cursor already inside the list is left alone.
+        let mut page = context_page(ContextPageUIState::Tracks {
+            track_table: TableState::default(),
+        });
+        page.select(1);
+        page.clamp_context_selection(&Context::Tracks {
+            tracks: vec![track("t1"), track("t2"), track("t3")],
+            desc: String::from("tracks"),
+        });
+        assert_eq!(
+            page.selected(),
+            Some(1),
+            "an in-bounds cursor must not move"
+        );
+
+        // A `None` cursor stays `None`.
+        let mut page = context_page(ContextPageUIState::Tracks {
+            track_table: TableState::default(),
+        });
+        page.clamp_context_selection(&Context::Tracks {
+            tracks: vec![track("t1")],
+            desc: String::from("tracks"),
+        });
+        assert_eq!(page.selected(), None, "an unset cursor must stay unset");
+    }
+
+    #[test]
+    fn artist_cursors_clamped_by_their_own_lengths() {
+        let mut page = context_page(ContextPageUIState::Artist {
+            top_track_table: TableState::default(),
+            album_table: TableState::default(),
+            related_artist_list: ListState::default(),
+            liked_track_table: TableState::default(),
+            focus: ArtistFocusState::TopTracks,
+        });
+        let PageState::Context {
+            state:
+                Some(ContextPageUIState::Artist {
+                    top_track_table,
+                    album_table,
+                    related_artist_list,
+                    liked_track_table,
+                    ..
+                }),
+            ..
+        } = &mut page
+        else {
+            unreachable!()
+        };
+        top_track_table.select(Some(100));
+        album_table.select(Some(50));
+        related_artist_list.select(Some(60));
+        liked_track_table.select(Some(9));
+
+        page.clamp_context_selection(&Context::Artist {
+            artist: artist("a0"),
+            top_tracks: vec![track("t1"), track("t2")],
+            albums: vec![album("al1")],
+            related_artists: vec![artist("a1"), artist("a2"), artist("a3")],
+        });
+
+        let PageState::Context {
+            state: Some(state), ..
+        } = &page
+        else {
+            unreachable!()
+        };
+        let ContextPageUIState::Artist {
+            top_track_table,
+            album_table,
+            related_artist_list,
+            liked_track_table,
+            ..
+        } = state
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            top_track_table.selected(),
+            Some(1),
+            "top tracks has length 2"
+        );
+        assert_eq!(album_table.selected(), Some(0), "albums has length 1");
+        assert_eq!(
+            related_artist_list.selected(),
+            Some(2),
+            "related artists has length 3"
+        );
+        assert_eq!(
+            liked_track_table.selected(),
+            Some(9),
+            "the liked track table must be left untouched"
+        );
+    }
+
+    #[test]
+    fn non_context_page_is_noop() {
+        let mut page = PageState::Library {
+            state: LibraryPageUIState::new(),
+        };
+        page.select(3);
+
+        page.clamp_context_selection(&Context::Show {
+            show: show("s1"),
+            episodes: vec![episode("e1")],
+            total_episodes: 1,
+        });
+
+        assert_eq!(page.selected(), Some(3), "a library page must be unchanged");
+    }
+
+    #[test]
+    fn variant_mismatch_is_noop() {
+        let mut page = context_page(ContextPageUIState::Playlist {
+            track_table: TableState::default(),
+        });
+        page.select(20);
+
+        page.clamp_context_selection(&Context::Show {
+            show: show("s1"),
+            episodes: vec![episode("e1")],
+            total_episodes: 1,
+        });
+
+        assert_eq!(
+            page.selected(),
+            Some(20),
+            "a Playlist page clamped against a Show context must not move"
+        );
     }
 }

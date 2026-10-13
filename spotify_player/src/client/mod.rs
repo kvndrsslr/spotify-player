@@ -7,11 +7,12 @@ use crate::{auth, config};
 use crate::{
     auth::AuthConfig,
     state::{
-        store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, Category, Context, ContextId,
-        Device, Episode, EpisodeId, FileCacheKey, Item, ItemId, MemoryCaches, Playback,
-        PlaybackMetadata, Playlist, PlaylistFolderItem, PlaylistId, SearchResults, SharedState,
-        Show, ShowId, Track, TrackId, UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI,
-        USER_RECENTLY_PLAYED_TRACKS_URI, USER_TOP_TRACKS_URI,
+        load_context_from_file_cache, store_context_in_file_cache, store_data_into_file_cache,
+        Album, AlbumId, Artist, ArtistId, Category, Context, ContextId, Device, Episode, EpisodeId,
+        FileCacheKey, Item, ItemId, MemoryCaches, PageState, Playback, PlaybackMetadata, Playlist,
+        PlaylistFolderItem, PlaylistId, SearchResults, SharedState, Show, ShowId, Track, TrackId,
+        UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI, USER_RECENTLY_PLAYED_TRACKS_URI,
+        USER_TOP_TRACKS_URI,
     },
 };
 
@@ -28,6 +29,7 @@ use reqwest::StatusCode;
 use rspotify::{http::Query, prelude::*};
 
 mod handlers;
+mod rate_limit;
 mod request;
 mod spotify;
 mod volume;
@@ -38,15 +40,13 @@ use serde::Deserialize;
 pub(crate) use spotify::WebApiClient;
 
 const SPOTIFY_API_ENDPOINT: &str = "https://api.spotify.com/v1";
-const PLAYBACK_TYPES: [&rspotify::model::AdditionalType; 2] = [
-    &rspotify::model::AdditionalType::Track,
-    &rspotify::model::AdditionalType::Episode,
-];
 
 /// The application's Spotify client
 #[derive(Clone)]
 pub struct AppClient {
     http: reqwest::Client,
+    /// Paces Web API requests and holds the client-wide rate-limit cooldown.
+    rate_limiter: Arc<rate_limit::RateLimiter>,
     /// Coalesces bursts of remote (Web API) volume adjustments into single calls.
     remote_volume: volume::RemoteVolume,
     /// The integrated Spotify client, mainly used for streaming and librespot integration
@@ -76,6 +76,11 @@ pub struct AppClient {
     /// Guards the post-change playback poll so rapid player events coalesce into a single
     /// in-flight loop rather than flooding Spotify's Web API (which 429 rate-limits).
     update_playback_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Context URIs whose `GetContext` fetch is currently running. The page-change handler
+    /// re-requests an uncached context every few seconds; while the first fetch is still in
+    /// flight (slow API or a shared 429 cooldown) a duplicate would start a second fetch that
+    /// resumes on the same cooldown and re-429s in waves. Duplicates are dropped here.
+    context_fetch_in_flight: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Per-url refetch bookkeeping for render-path image cache misses: attempts + next
     /// eligible instant (exponential backoff).
     #[cfg(feature = "image")]
@@ -235,6 +240,12 @@ impl From<SimplifiedEpisodeInfo> for Episode {
 struct ShowSearchResult {
     shows: rspotify::model::Page<ShowInfo>,
 }
+
+/// A `/me/player/devices` response body.
+#[derive(Deserialize, Debug)]
+struct DevicesResponse {
+    devices: Vec<rspotify::model::Device>,
+}
 /// A single cover image from an episode's `images` array.
 #[cfg(feature = "image")]
 #[derive(Deserialize, Debug, Clone)]
@@ -268,7 +279,12 @@ impl AppClient {
 
         Ok(Self {
             spotify: Arc::new(spotify::Spotify::new()),
-            http: reqwest::Client::new(),
+            // A hung request must not pin its caller forever; the Web API answers well within
+            // this bound, and the retry logic below re-issues anything that trips it.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+            rate_limiter: Arc::new(rate_limit::RateLimiter::new()),
             auth_config,
             api_client,
             remote_volume,
@@ -282,6 +298,7 @@ impl AppClient {
             #[cfg(feature = "streaming")]
             stream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             update_playback_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            context_fetch_in_flight: Arc::new(parking_lot::Mutex::default()),
             #[cfg(feature = "image")]
             image_retries: Arc::new(parking_lot::Mutex::default()),
         })
@@ -331,6 +348,8 @@ impl AppClient {
     /// See [`Self::set_integrated_volume`]; without the streaming feature there is no
     /// integrated player, so every volume change targets the debounced remote path.
     #[cfg(not(feature = "streaming"))]
+    // Kept `async` to match the streaming signature so call sites stay feature-independent.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn set_integrated_volume(
         &self,
         _playback_device: Option<&str>,
@@ -364,6 +383,8 @@ impl AppClient {
     }
 
     #[cfg(not(feature = "streaming"))]
+    // Kept `async` to match the streaming signature so call sites stay feature-independent.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn set_integrated_seek(
         &self,
         _playback_device: Option<&str>,
@@ -373,6 +394,7 @@ impl AppClient {
     }
     /// Refetch image urls that render paths reported missing, with per-url exponential
     /// backoff; runs on playback polls and manual refreshes.
+    #[cfg(feature = "image")]
     pub(crate) fn recover_missing_images(&self, state: &SharedState) {
         let pending = {
             let mut guard = state.ui.try_lock();
@@ -489,8 +511,12 @@ impl AppClient {
                 // a retry logic is implemented to ensure the application's state is properly initialized
                 let delay = std::time::Duration::from_secs(1);
 
-                for _ in 0..5 {
-                    tokio::time::sleep(delay).await;
+                for i in 0..5 {
+                    // The first attempt is immediate; later ones wait out Spotify's
+                    // propagation delay rather than delaying the very first read.
+                    if i > 0 {
+                        tokio::time::sleep(delay).await;
+                    }
 
                     if let Err(err) = client.retrieve_current_playback(&state, false).await {
                         tracing::error!("Failed to retrieve current playback: {err:#}");
@@ -797,6 +823,210 @@ impl AppClient {
         Ok(Some(playback))
     }
 
+    /// Handle a `GetContext` request, dropping a duplicate whose identical fetch is already
+    /// running.
+    ///
+    /// The page-change handler re-issues `GetContext` every few seconds while the context is
+    /// uncached. While a fetch is in flight that duplicate would start a second fetch which
+    /// then resumes on the same shared 429 cooldown and re-429s in waves; skip it instead —
+    /// the in-flight fetch publishes the result.
+    async fn handle_get_context(&self, state: &SharedState, context: ContextId) -> Result<()> {
+        let uri = context.uri();
+
+        // Take the guard in a temporary so it is dropped before the fetch's first await.
+        if !self.context_fetch_in_flight.lock().insert(uri.clone()) {
+            tracing::debug!(
+                "GetContext for {uri} is already in flight; skipping duplicate request"
+            );
+            return Ok(());
+        }
+
+        let result = self.get_context(state, context).await;
+
+        // Remove on both paths: the next page-change tick must be able to retry after a failure.
+        self.context_fetch_in_flight.lock().remove(&uri);
+        result
+    }
+
+    async fn get_context(&self, state: &SharedState, context: ContextId) -> Result<()> {
+        let uri = context.uri();
+        let is_liked = uri == USER_LIKED_TRACKS_URI;
+        // Liked tracks are kept in sync through `user_data.saved_tracks` and are always
+        // refreshed; every other context can be served from the on-disk cache.
+        let cache_miss = !is_liked && !state.data.read().caches.context.contains_key(&uri);
+        let cache_folder = config::get_config().cache_folder.clone();
+        let mut needs_fetch = false;
+
+        if cache_miss {
+            match load_context_from_file_cache(&cache_folder, &uri) {
+                // Fresh and complete: render from disk without a request.
+                Some(cached) if cached.is_fresh() && !cached.context.is_incomplete() => {
+                    state.data.write().caches.context.insert(
+                        uri.clone(),
+                        cached.context,
+                        *TTL_CACHE_DURATION,
+                    );
+                }
+                // Stale or partial: render from disk now, replace once the refresh lands.
+                Some(cached) => {
+                    state.data.write().caches.context.insert(
+                        uri.clone(),
+                        cached.context,
+                        *TTL_CACHE_DURATION,
+                    );
+                    needs_fetch = true;
+                }
+                None => needs_fetch = true,
+            }
+        }
+
+        if is_liked {
+            // Seed the page from the disk-cached library so it paints before the
+            // always-refreshed paginated fetch lands; `/me/tracks` returns newest-first.
+            if !state.data.read().caches.context.contains_key(&uri) {
+                let mut tracks: Vec<Track> = state
+                    .data
+                    .read()
+                    .user_data
+                    .saved_tracks
+                    .values()
+                    .cloned()
+                    .collect();
+                // Many tracks share `added_at` (bulk library imports), and `saved_tracks` is a
+                // `HashMap`, so a tiebreak on track id is required for the seed order to be
+                // identical across runs.
+                tracks.sort_by_key(|t| (std::cmp::Reverse(t.added_at), t.id.uri()));
+                if !tracks.is_empty() {
+                    state.data.write().caches.context.insert(
+                        uri.clone(),
+                        Context::Tracks {
+                            tracks,
+                            desc: "User's liked tracks".to_string(),
+                        },
+                        *TTL_CACHE_DURATION,
+                    );
+                }
+            }
+            needs_fetch = true; // liked tracks stay always-refreshed
+        }
+
+        if needs_fetch {
+            let ctx = match context {
+                ContextId::Playlist(playlist_id) => self.playlist_context(playlist_id).await?,
+                ContextId::Album(album_id) => self.album_context(album_id).await?,
+                ContextId::Artist(artist_id) => self.artist_context(artist_id).await?,
+                ContextId::Tracks(tracks_id) => match tracks_id.uri.as_str() {
+                    USER_TOP_TRACKS_URI => {
+                        let Some(tracks) =
+                            self.top_tracks(rate_limit::Priority::Background).await?
+                        else {
+                            // Deferred while the client is backed off; the seeded/previous
+                            // snapshot stays in place and a later trigger retries it.
+                            tracing::debug!(
+                                "deferring the top-tracks refresh: client is backed off"
+                            );
+                            return Ok(());
+                        };
+                        Context::Tracks {
+                            tracks,
+                            desc: "User's top tracks".to_string(),
+                        }
+                    }
+                    USER_RECENTLY_PLAYED_TRACKS_URI => {
+                        let Some(tracks) = self
+                            .recently_played_tracks(rate_limit::Priority::Background)
+                            .await?
+                        else {
+                            tracing::debug!(
+                                "deferring the recently-played refresh: client is backed off"
+                            );
+                            return Ok(());
+                        };
+                        Context::Tracks {
+                            tracks,
+                            desc: "User's recently played tracks".to_string(),
+                        }
+                    }
+                    USER_LIKED_TRACKS_URI => {
+                        let Some(tracks) =
+                            self.saved_tracks(rate_limit::Priority::Background).await?
+                        else {
+                            // Keep the seed written above; refresh later.
+                            tracing::debug!(
+                                "deferring the liked-tracks refresh: client is backed off"
+                            );
+                            return Ok(());
+                        };
+                        let tracks_hm = tracks
+                            .iter()
+                            .map(|t| (t.id.uri(), t.clone()))
+                            .collect::<HashMap<_, _>>();
+                        store_data_into_file_cache(
+                            FileCacheKey::SavedTracks,
+                            &config::get_config().cache_folder,
+                            &tracks_hm,
+                        )
+                        .context("store user's saved tracks into the cache folder")?;
+                        state.data.write().user_data.saved_tracks = tracks_hm;
+                        Context::Tracks {
+                            tracks,
+                            desc: "User's liked tracks".to_string(),
+                        }
+                    }
+                    u if u.starts_with("radio:") => Context::Tracks {
+                        tracks: self.radio_tracks(u["radio:".len()..].to_string()).await?,
+                        desc: tracks_id.kind.clone(),
+                    },
+                    uri => anyhow::bail!("unsupported Tracks context: {uri}"),
+                },
+                ContextId::Show(show_id) => {
+                    let prefetch_id = show_id.clone_static();
+                    let ctx = self.show_context(show_id).await?;
+                    if let Context::Show {
+                        episodes,
+                        total_episodes,
+                        ..
+                    } = &ctx
+                    {
+                        if episodes.len() < *total_episodes {
+                            self.spawn_show_episodes_prefetch(
+                                state.clone(),
+                                prefetch_id,
+                                uri.clone(),
+                                episodes.len(),
+                                *total_episodes,
+                            );
+                        }
+                    }
+                    ctx
+                }
+            };
+
+            state
+                .data
+                .write()
+                .caches
+                .context
+                .insert(uri.clone(), ctx.clone(), *TTL_CACHE_DURATION);
+            if !is_liked {
+                // Liked tracks persist through `SavedTracks_cache.json` instead.
+                if let Err(err) = store_context_in_file_cache(&cache_folder, &uri, &ctx) {
+                    tracing::warn!("Failed to store context {uri} in the file cache: {err:#}");
+                }
+            }
+
+            // A background refresh may have shrunk the list the user is looking at.
+            let mut ui = state.ui.lock();
+            let page = ui.current_page_mut();
+            if matches!(page, PageState::Context { id: Some(page_id), .. } if page_id.uri() == uri)
+            {
+                page.clamp_context_selection(&ctx);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle a client request
     pub(crate) async fn handle_request(
         &self,
@@ -867,6 +1097,7 @@ impl AppClient {
             }
             ClientRequest::GetCurrentPlayback => {
                 self.retrieve_current_playback(state, true).await?;
+                #[cfg(feature = "image")]
                 self.recover_missing_images(state);
             }
             ClientRequest::GetDevices => {
@@ -884,7 +1115,13 @@ impl AppClient {
                 state.player.write().devices = devices;
             }
             ClientRequest::GetUserPlaylists => {
-                let playlists = self.current_user_playlists().await?;
+                let Some(playlists) = self
+                    .user_playlists(rate_limit::Priority::Background)
+                    .await?
+                else {
+                    tracing::debug!("deferring the playlists refresh: client is backed off");
+                    return Ok(());
+                };
                 let node = state.data.read().user_data.playlist_folder_node.clone();
                 let playlists = if let Some(node) = node.filter(|n| !n.children.is_empty()) {
                     crate::playlist_folders::structurize(playlists, &node.children)
@@ -903,7 +1140,13 @@ impl AppClient {
                 state.data.write().user_data.playlists = playlists;
             }
             ClientRequest::GetUserFollowedArtists => {
-                let artists = self.current_user_followed_artists().await?;
+                let Some(artists) = self
+                    .followed_artists(rate_limit::Priority::Background)
+                    .await?
+                else {
+                    tracing::debug!("deferring the followed artists refresh: client is backed off");
+                    return Ok(());
+                };
                 store_data_into_file_cache(
                     FileCacheKey::FollowedArtists,
                     &config::get_config().cache_folder,
@@ -913,7 +1156,11 @@ impl AppClient {
                 state.data.write().user_data.followed_artists = artists;
             }
             ClientRequest::GetUserSavedAlbums => {
-                let albums = self.current_user_saved_albums().await?;
+                let Some(albums) = self.saved_albums(rate_limit::Priority::Background).await?
+                else {
+                    tracing::debug!("deferring the saved albums refresh: client is backed off");
+                    return Ok(());
+                };
                 store_data_into_file_cache(
                     FileCacheKey::SavedAlbums,
                     &config::get_config().cache_folder,
@@ -923,7 +1170,10 @@ impl AppClient {
                 state.data.write().user_data.saved_albums = albums;
             }
             ClientRequest::GetUserSavedShows => {
-                let shows = self.current_user_saved_shows().await?;
+                let Some(shows) = self.saved_shows(rate_limit::Priority::Background).await? else {
+                    tracing::debug!("deferring the saved shows refresh: client is backed off");
+                    return Ok(());
+                };
                 store_data_into_file_cache(
                     FileCacheKey::SavedShows,
                     &config::get_config().cache_folder,
@@ -933,81 +1183,7 @@ impl AppClient {
                 state.data.write().user_data.saved_shows = shows;
             }
             ClientRequest::GetContext(context) => {
-                let uri = context.uri();
-                // Liked tracks must always be refreshed to keep user_data.saved_tracks in sync.
-                let cache_miss = uri != USER_LIKED_TRACKS_URI
-                    && !state.data.read().caches.context.contains_key(&uri);
-                let is_liked = uri == USER_LIKED_TRACKS_URI;
-                if cache_miss || is_liked {
-                    let ctx = match context {
-                        ContextId::Playlist(playlist_id) => {
-                            self.playlist_context(playlist_id).await?
-                        }
-                        ContextId::Album(album_id) => self.album_context(album_id).await?,
-                        ContextId::Artist(artist_id) => self.artist_context(artist_id).await?,
-                        ContextId::Tracks(tracks_id) => match tracks_id.uri.as_str() {
-                            USER_TOP_TRACKS_URI => Context::Tracks {
-                                tracks: self.current_user_top_tracks().await?,
-                                desc: "User's top tracks".to_string(),
-                            },
-                            USER_RECENTLY_PLAYED_TRACKS_URI => Context::Tracks {
-                                tracks: self.current_user_recently_played_tracks().await?,
-                                desc: "User's recently played tracks".to_string(),
-                            },
-                            USER_LIKED_TRACKS_URI => {
-                                let tracks = self.current_user_saved_tracks().await?;
-                                let tracks_hm = tracks
-                                    .iter()
-                                    .map(|t| (t.id.uri(), t.clone()))
-                                    .collect::<HashMap<_, _>>();
-                                store_data_into_file_cache(
-                                    FileCacheKey::SavedTracks,
-                                    &config::get_config().cache_folder,
-                                    &tracks_hm,
-                                )
-                                .context("store user's saved tracks into the cache folder")?;
-                                state.data.write().user_data.saved_tracks = tracks_hm;
-                                Context::Tracks {
-                                    tracks,
-                                    desc: "User's liked tracks".to_string(),
-                                }
-                            }
-                            u if u.starts_with("radio:") => Context::Tracks {
-                                tracks: self.radio_tracks(u["radio:".len()..].to_string()).await?,
-                                desc: tracks_id.kind.clone(),
-                            },
-                            uri => anyhow::bail!("unsupported Tracks context: {uri}"),
-                        },
-                        ContextId::Show(show_id) => {
-                            let prefetch_id = show_id.clone_static();
-                            let ctx = self.show_context(show_id).await?;
-                            if let Context::Show {
-                                episodes,
-                                total_episodes,
-                                ..
-                            } = &ctx
-                            {
-                                if episodes.len() < *total_episodes {
-                                    self.spawn_show_episodes_prefetch(
-                                        state.clone(),
-                                        prefetch_id,
-                                        uri.clone(),
-                                        episodes.len(),
-                                        *total_episodes,
-                                    );
-                                }
-                            }
-                            ctx
-                        }
-                    };
-
-                    state
-                        .data
-                        .write()
-                        .caches
-                        .context
-                        .insert(uri, ctx, *TTL_CACHE_DURATION);
-                }
+                self.handle_get_context(state, context).await?;
             }
             ClientRequest::Search(query) => {
                 if !state.data.read().caches.search.contains_key(&query) {
@@ -1125,9 +1301,29 @@ impl AppClient {
         }
     }
 
+    /// Get the current user's profile.
+    ///
+    /// Inherent so it goes through the throttled [`Self::http_get_with`] layer instead of
+    /// rspotify (whose HTTP client has no pacing or 429 handling).
+    pub async fn current_user(&self) -> Result<rspotify::model::PrivateUser> {
+        self.http_get_with(
+            &format!("{SPOTIFY_API_ENDPOINT}/me"),
+            &Query::new(),
+            rate_limit::Priority::High,
+        )
+        .await
+    }
+
     /// Get user available devices
     pub async fn available_devices(&self) -> Result<Vec<rspotify::model::Device>> {
-        Ok(self.device().await?)
+        let response = self
+            .http_get_with::<DevicesResponse>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/player/devices"),
+                &Query::new(),
+                rate_limit::Priority::High,
+            )
+            .await?;
+        Ok(response.devices)
     }
 
     pub fn update_playback(&self, state: &SharedState) {
@@ -1216,6 +1412,8 @@ impl AppClient {
 
     /// Without the streaming feature there is no local player, so nothing to wait for.
     #[cfg(not(feature = "streaming"))]
+    // Kept `async` to match the streaming signature so call sites stay feature-independent.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn playback_matches_stream(&self, _state: &SharedState) -> bool {
         true
     }
@@ -1331,24 +1529,57 @@ impl AppClient {
 
     /// Get the saved (liked) tracks of the current user
     pub async fn current_user_saved_tracks(&self) -> Result<Vec<Track>> {
-        let tracks = self
-            .all_paging_items::<rspotify::model::SavedTrack>(
-                &format!("{SPOTIFY_API_ENDPOINT}/me/tracks"),
-                0, // we don't know the total number of saved tracks beforehand
-            )
-            .await?;
-
-        Ok(tracks
-            .into_iter()
-            .filter_map(|t| Track::try_from_full_track(t.track))
-            .collect())
+        Self::require_ready(
+            "saved tracks",
+            self.saved_tracks(rate_limit::Priority::Normal).await?,
+        )
     }
 
-    /// Get the recently played tracks of the current user
-    pub async fn current_user_recently_played_tracks(&self) -> Result<Vec<Track>> {
-        let first_page = self.current_user_recently_played(Some(50), None).await?;
+    /// Get the saved tracks at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn saved_tracks(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Track>>> {
+        let Some(tracks) = self
+            .all_paging_items_optional::<rspotify::model::SavedTrack>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/tracks"),
+                0, // we don't know the total number of saved tracks beforehand
+                priority,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
 
-        let play_histories = self.all_cursor_based_paging_items(first_page).await?;
+        Ok(Some(
+            tracks
+                .into_iter()
+                .filter_map(|t| Track::try_from_full_track(t.track))
+                .collect(),
+        ))
+    }
+
+    /// Get the recently played tracks at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn recently_played_tracks(
+        &self,
+        priority: rate_limit::Priority,
+    ) -> Result<Option<Vec<Track>>> {
+        let Some(first_page) = self
+            .http_get_optional::<rspotify::model::CursorBasedPage<rspotify::model::PlayHistory>>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/player/recently-played"),
+                &Query::from([("limit", "50")]),
+                priority,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(play_histories) = self
+            .all_cursor_based_paging_items_optional(first_page, priority)
+            .await?
+        else {
+            return Ok(None);
+        };
 
         // de-duplicate the tracks returned from the recently-played API
         let mut tracks = Vec::<Track>::new();
@@ -1359,95 +1590,190 @@ impl AppClient {
                 }
             }
         }
-        Ok(tracks)
+        Ok(Some(tracks))
     }
 
     /// Get the top tracks of the current user
     pub async fn current_user_top_tracks(&self) -> Result<Vec<Track>> {
-        let tracks = self
-            .all_paging_items::<rspotify::model::FullTrack>(
+        Self::require_ready(
+            "top tracks",
+            self.top_tracks(rate_limit::Priority::Normal).await?,
+        )
+    }
+
+    /// Get the top tracks at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn top_tracks(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Track>>> {
+        let Some(tracks) = self
+            .all_paging_items_optional::<rspotify::model::FullTrack>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/top/tracks"),
                 0, // we don't know the total number of top tracks beforehand
+                priority,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
 
-        Ok(tracks
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect())
+        Ok(Some(
+            tracks
+                .into_iter()
+                .filter_map(Track::try_from_full_track)
+                .collect(),
+        ))
     }
 
     /// Get all playlists of the current user
     pub async fn current_user_playlists(&self) -> Result<Vec<Playlist>> {
-        let playlists = self
-            .all_paging_items::<rspotify::model::SimplifiedPlaylist>(
+        Self::require_ready(
+            "playlists",
+            self.user_playlists(rate_limit::Priority::Normal).await?,
+        )
+    }
+
+    /// Get the current user's playlists at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn user_playlists(
+        &self,
+        priority: rate_limit::Priority,
+    ) -> Result<Option<Vec<Playlist>>> {
+        let Some(playlists) = self
+            .all_paging_items_optional::<rspotify::model::SimplifiedPlaylist>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/playlists"),
                 0, // we don't know the total number of playlists beforehand
+                priority,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
 
-        Ok(playlists
-            .into_iter()
-            .map(std::convert::Into::into)
-            .collect())
+        Ok(Some(
+            playlists
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect(),
+        ))
     }
 
     /// Get all followed artists of the current user
     pub async fn current_user_followed_artists(&self) -> Result<Vec<Artist>> {
-        let first_page = self
-            .deref()
-            .current_user_followed_artists(None, None)
-            .await?;
+        Self::require_ready(
+            "followed artists",
+            self.followed_artists(rate_limit::Priority::Normal).await?,
+        )
+    }
+
+    /// Get the followed artists at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn followed_artists(
+        &self,
+        priority: rate_limit::Priority,
+    ) -> Result<Option<Vec<Artist>>> {
+        // Inherent fetch (throttled + 429-handled) instead of rspotify's unthrottled call.
+        let Some(first_page) = self
+            .http_get_optional::<rspotify::model::CursorPageFullArtists>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/following"),
+                &Query::from([("type", "artist"), ("limit", "50")]),
+                priority,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let first_page = first_page.artists;
 
         // followed artists pagination is handled different from
         // other paginations. The endpoint uses cursor-based pagination.
         let mut artists = first_page.items;
         let mut maybe_next = first_page.next;
         while let Some(url) = maybe_next {
-            let mut next_page = self
-                .http_get::<rspotify::model::CursorPageFullArtists>(&url, &Query::new())
+            let Some(next_page) = self
+                .http_get_optional::<rspotify::model::CursorPageFullArtists>(
+                    &url,
+                    &Query::new(),
+                    priority,
+                )
                 .await?
-                .artists;
+            else {
+                return Ok(None);
+            };
+            let mut next_page = next_page.artists;
             artists.append(&mut next_page.items);
             maybe_next = next_page.next;
         }
 
         // converts `rspotify::model::FullArtist` into `state::Artist`
-        Ok(artists.into_iter().map(std::convert::Into::into).collect())
+        Ok(Some(
+            artists.into_iter().map(std::convert::Into::into).collect(),
+        ))
+    }
+
+    /// Get the current user's playback queue.
+    ///
+    /// Inherent so it goes through the throttled [`Self::http_get_with`] layer instead of
+    /// rspotify.
+    pub async fn current_user_queue(&self) -> Result<rspotify::model::CurrentUserQueue> {
+        self.http_get_with(
+            &format!("{SPOTIFY_API_ENDPOINT}/me/player/queue"),
+            &Query::new(),
+            rate_limit::Priority::High,
+        )
+        .await
     }
 
     /// Get all saved albums of the current user
     pub async fn current_user_saved_albums(&self) -> Result<Vec<Album>> {
-        let albums = self
-            .all_paging_items::<rspotify::model::SavedAlbum>(
-                &format!("{SPOTIFY_API_ENDPOINT}/me/albums"),
-                0, // we don't know the total number of saved albums beforehand
-            )
-            .await?;
-
-        // Converts `rspotify::model::SavedAlbum` into `state::Album`
-        Ok(albums.into_iter().map(Album::from).collect())
+        Self::require_ready(
+            "saved albums",
+            self.saved_albums(rate_limit::Priority::Normal).await?,
+        )
     }
 
-    /// Get all saved shows of the current user
-    pub async fn current_user_saved_shows(&self) -> Result<Vec<Show>> {
-        let shows = self
-            .all_paging_items::<SavedShow>(
+    /// Get the saved albums at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn saved_albums(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Album>>> {
+        let Some(albums) = self
+            .all_paging_items_optional::<rspotify::model::SavedAlbum>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/albums"),
+                0, // we don't know the total number of saved albums beforehand
+                priority,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // Converts `rspotify::model::SavedAlbum` into `state::Album`
+        Ok(Some(albums.into_iter().map(Album::from).collect()))
+    }
+
+    /// Get the saved shows at `priority`; `Ok(None)` when a
+    /// [`rate_limit::Priority::Background`] fetch was deferred.
+    pub async fn saved_shows(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Show>>> {
+        let Some(shows) = self
+            .all_paging_items_optional::<SavedShow>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/shows"),
                 0, // we don't know the total number of saved shows beforehand
+                priority,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
 
-        Ok(shows
-            .into_iter()
-            .map(|s| Show {
-                id: s.show.id,
-                name: s.show.name,
-                publisher: s.show.publisher,
-                #[cfg(feature = "image")]
-                image_url: s.show.images.first().map(|i| i.url.clone()),
-            })
-            .collect())
+        Ok(Some(
+            shows
+                .into_iter()
+                .map(|s| Show {
+                    id: s.show.id,
+                    name: s.show.name,
+                    publisher: s.show.publisher,
+                    #[cfg(feature = "image")]
+                    image_url: s.show.images.first().map(|i| i.url.clone()),
+                })
+                .collect(),
+        ))
     }
 
     /// Get all albums of an artist
@@ -1459,6 +1785,7 @@ impl AppClient {
                     artist_id.id()
                 ),
                 0, // we don't know the total number of artist albums beforehand
+                rate_limit::Priority::Normal,
             )
             .await?
             .into_iter()
@@ -1911,20 +2238,21 @@ impl AppClient {
         tracing::info!("Get playlist context: {}", playlist_uri);
 
         let playlist = self
-            .playlist(
-                playlist_id.clone(),
-                None,
-                Some(rspotify::model::Market::FromToken),
+            .http_get_with::<rspotify::model::FullPlaylist>(
+                &format!("{SPOTIFY_API_ENDPOINT}/playlists/{}", playlist_id.id()),
+                &Query::from([("market", "from_token")]),
+                rate_limit::Priority::Normal,
             )
             .await?;
 
         let tracks = self
             .all_paging_items(
                 &format!(
-                    "{SPOTIFY_API_ENDPOINT}/playlists/{}/tracks",
+                    "{SPOTIFY_API_ENDPOINT}/playlists/{}/items",
                     playlist_id.id(),
                 ),
                 playlist.tracks.total as usize,
+                rate_limit::Priority::Normal,
             )
             .await?
             .into_iter()
@@ -1943,7 +2271,11 @@ impl AppClient {
         tracing::info!("Get album context: {}", album_uri);
 
         let album = self
-            .album(album_id.clone(), Some(rspotify::model::Market::FromToken))
+            .http_get_with::<rspotify::model::FullAlbum>(
+                &format!("{SPOTIFY_API_ENDPOINT}/albums/{}", album_id.id()),
+                &Query::from([("market", "from_token")]),
+                rate_limit::Priority::Normal,
+            )
             .await?;
 
         let total_tracks = album.tracks.total as usize;
@@ -1956,6 +2288,7 @@ impl AppClient {
             .all_paging_items(
                 &format!("{SPOTIFY_API_ENDPOINT}/albums/{}/tracks", album_id.id()),
                 total_tracks,
+                rate_limit::Priority::Normal,
             )
             .await?
             .into_iter()
@@ -1971,6 +2304,20 @@ impl AppClient {
             .collect::<Vec<_>>();
 
         Ok(Context::Album { album, tracks })
+    }
+
+    /// Get a single artist's metadata.
+    ///
+    /// Inherent so it goes through the throttled [`Self::http_get_with`] layer instead of
+    /// rspotify. Takes the ID by value to mirror rspotify's signature and keep existing call
+    /// sites (`artist_id.as_ref()` / `id.clone()`) compiling.
+    pub async fn artist(&self, id: ArtistId<'_>) -> Result<rspotify::model::FullArtist> {
+        self.http_get_with(
+            &format!("{SPOTIFY_API_ENDPOINT}/artists/{}", id.id()),
+            &Query::new(),
+            rate_limit::Priority::High,
+        )
+        .await
     }
 
     /// Get an artist context data
@@ -2165,8 +2512,49 @@ impl AppClient {
             .insert(url.to_owned(), image);
         Ok(())
     }
-    /// Make a GET HTTP request to the Spotify server
+    /// Unwrap a possibly-deferred result of a request that can never be deferred (only
+    /// [`rate_limit::Priority::Background`] requests defer).
+    fn require_ready<T>(what: &str, value: Option<T>) -> Result<T> {
+        value.ok_or_else(|| anyhow::anyhow!("{what} request was unexpectedly deferred"))
+    }
+
+    /// Make a GET HTTP request to the Spotify server at [`rate_limit::Priority::Normal`].
     async fn http_get<T>(&self, url: &str, payload: &Query<'_>) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.http_get_with(url, payload, rate_limit::Priority::Normal)
+            .await
+    }
+
+    /// Make a GET HTTP request to the Spotify server, paced according to `priority`.
+    ///
+    /// Only [`rate_limit::Priority::Background`] can defer; use [`Self::http_get_background`]
+    /// for those call sites.
+    async fn http_get_with<T>(
+        &self,
+        url: &str,
+        payload: &Query<'_>,
+        priority: rate_limit::Priority,
+    ) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match self.http_get_optional(url, payload, priority).await? {
+            Some(value) => Ok(value),
+            // Only background acquisitions defer, and no caller of this method uses that class.
+            None => anyhow::bail!("unexpected deferral of a {priority:?} request to {url}"),
+        }
+    }
+
+    /// Paced GET shared by the wrappers above; `Ok(None)` means the request was deferred
+    /// (possible only for [`rate_limit::Priority::Background`]).
+    async fn http_get_optional<T>(
+        &self,
+        url: &str,
+        payload: &Query<'_>,
+        priority: rate_limit::Priority,
+    ) -> Result<Option<T>>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -2178,15 +2566,32 @@ impl AppClient {
             text.to_string()
         }
 
-        // Respect Spotify's rate limit: on a 429, honor `Retry-After` (bounded) and retry a few
-        // times instead of failing outright or immediately hammering the API.
-        const MAX_RATE_LIMIT_RETRIES: usize = 3;
-        const MAX_BACKOFF_SECS: u64 = 10;
+        // Respect Spotify's rate limit: on a 429, pause the *whole* client for the server's
+        // `Retry-After` and retry. Each request waiting on the shared cooldown (instead of
+        // sleeping and retrying on its own schedule) is what prevents retry storms.
+        const MAX_RATE_LIMIT_RETRIES: usize = 5;
 
         let mut attempt = 0;
         loop {
             let access_token = self.token().await.context("get token")?;
             tracing::debug!("{access_token} {url}");
+
+            // `High`/`Normal` may probe an active cooldown once per window; `Background` defers.
+            // A retry (after the request's own 429) must not consume the probe it already spent.
+            let outcome = if attempt == 0 {
+                self.rate_limiter.acquire(priority).await
+            } else {
+                self.rate_limiter.acquire_after_rate_limit(priority).await
+            };
+            match outcome {
+                rate_limit::AcquireOutcome::Ready => {}
+                rate_limit::AcquireOutcome::Deferred => {
+                    tracing::debug!(
+                        "deferring {priority:?} request to {url}: client is backed off"
+                    );
+                    return Ok(None);
+                }
+            }
 
             let response = self
                 .http
@@ -2207,7 +2612,27 @@ impl AppClient {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(1);
+                    .map(std::time::Duration::from_secs);
+
+                let applied_cooldown = self.rate_limiter.on_rate_limited(retry_after);
+
+                if !rate_limit::should_retry_in_place(applied_cooldown) {
+                    // Long pause: the quota window is exhausted for everyone sharing it, so
+                    // holding this handler task for another tens of seconds per attempt wins
+                    // nothing. Bail and let the caller's own cadence (the page-change re-issue,
+                    // or the next user action) retry later - each such retry gets its own
+                    // single probe. The cooldown above is still registered for everyone else.
+                    let text = response.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        "rate-limited (429) requesting {url}; server asked to pause {applied_cooldown:?}, \
+                         longer than the {threshold:?} transient threshold, so not retrying in place",
+                        threshold = rate_limit::TRANSIENT_COOLDOWN,
+                    );
+                    anyhow::bail!(
+                        "rate-limited (429) requesting {url}: server asked to pause {applied_cooldown:?} \
+                         (window exhausted), not retrying in place: {text}"
+                    );
+                }
 
                 attempt += 1;
                 if attempt >= MAX_RATE_LIMIT_RETRIES {
@@ -2217,26 +2642,44 @@ impl AppClient {
                     );
                 }
 
-                let delay = std::time::Duration::from_secs(retry_after.min(MAX_BACKOFF_SECS));
                 tracing::warn!(
-                    "rate-limited (429) requesting {url}; backing off {delay:?} (attempt {attempt}/{MAX_RATE_LIMIT_RETRIES})"
+                    "rate-limited (429) requesting {url}; pausing the client for {retry_after:?} (attempt {attempt}/{MAX_RATE_LIMIT_RETRIES})"
                 );
-                tokio::time::sleep(delay).await;
+                // the next `acquire` waits out the shared cooldown
                 continue;
             }
 
             let text = process_spotify_api_response(&response.text().await?);
             tracing::debug!("{text}");
 
-            if status != StatusCode::OK {
+            if status != StatusCode::OK && status != StatusCode::NO_CONTENT {
                 anyhow::bail!("failed to send a Spotify API request {url}: {text}");
             }
 
-            return Ok(serde_json::from_str(&text)?);
+            // The API answered, so end the client-wide pause early and reset the backoff.
+            self.rate_limiter.on_success();
+
+            if status == StatusCode::NO_CONTENT || text.is_empty() {
+                // Bodyless success (e.g. `GET /me/player` with nothing playing): parse the
+                // JSON `null` literal, so callers expecting `Option<T>` get `None`. rspotify
+                // treated an empty body the same way, and some endpoints answer an empty body
+                // with `200 OK` rather than `204 No Content`.
+                return Ok(Some(serde_json::from_str("null")?));
+            }
+
+            return Ok(Some(serde_json::from_str(&text)?));
         }
     }
 
-    async fn all_paging_items<T>(&self, base_url: &str, mut count: usize) -> Result<Vec<T>>
+    /// Fetch all items of a paging endpoint at `priority`, returning `Ok(None)` without
+    /// sending anything when a [`rate_limit::Priority::Background`] request was deferred (so a
+    /// partial list is never cached).
+    async fn all_paging_items_optional<T>(
+        &self,
+        base_url: &str,
+        mut count: usize,
+        priority: rate_limit::Priority,
+    ) -> Result<Option<Vec<T>>>
     where
         T: serde::de::DeserializeOwned + std::fmt::Debug,
     {
@@ -2267,7 +2710,7 @@ impl AppClient {
                         ("limit", &limit_str),
                         ("offset", &offset_str),
                     ]);
-                    self.http_get::<rspotify::model::Page<T>>(base_url, &params)
+                    self.http_get_optional::<rspotify::model::Page<T>>(base_url, &params, priority)
                         .await
                 });
             }
@@ -2275,7 +2718,11 @@ impl AppClient {
             let results = futures::future::try_join_all(futures).await?;
 
             let mut found_empty = false;
-            for mut page in results {
+            for page in results {
+                let Some(mut page) = page else {
+                    // A page was deferred mid-pagination: skip the whole refresh.
+                    return Ok(None);
+                };
                 if page.items.is_empty() {
                     found_empty = true;
                     break;
@@ -2290,33 +2737,64 @@ impl AppClient {
             offset += n_jobs * PAGE_LIMIT;
         }
 
-        Ok(all_items)
+        Ok(Some(all_items))
     }
 
-    /// Get all cursor-based paging items starting from a pagination object of the first page
-    async fn all_cursor_based_paging_items<T>(
+    /// Like [`Self::all_paging_items_optional`], for a request that cannot be deferred.
+    async fn all_paging_items<T>(
+        &self,
+        base_url: &str,
+        count: usize,
+        priority: rate_limit::Priority,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        self.all_paging_items_optional(base_url, count, priority)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unexpected deferral while paging {base_url}"))
+    }
+
+    /// Get all cursor-based paging items starting from a pagination object of the first page.
+    /// `Ok(None)` when a [`rate_limit::Priority::Background`] request was deferred.
+    async fn all_cursor_based_paging_items_optional<T>(
         &self,
         first_page: rspotify::model::CursorBasedPage<T>,
-    ) -> Result<Vec<T>>
+        priority: rate_limit::Priority,
+    ) -> Result<Option<Vec<T>>>
     where
         T: serde::de::DeserializeOwned,
     {
         let mut items = first_page.items;
         let mut maybe_next = first_page.next;
         while let Some(url) = maybe_next {
-            let mut next_page = self
-                .http_get::<rspotify::model::CursorBasedPage<T>>(&url, &Query::new())
-                .await?;
+            let Some(mut next_page) = self
+                .http_get_optional::<rspotify::model::CursorBasedPage<T>>(
+                    &url,
+                    &Query::new(),
+                    priority,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
             items.append(&mut next_page.items);
             maybe_next = next_page.next;
         }
-        Ok(items)
+        Ok(Some(items))
     }
 
     pub async fn current_playback2(
         &self,
     ) -> Result<Option<rspotify::model::CurrentPlaybackContext>> {
-        Ok(self.current_playback(None, PLAYBACK_TYPES.into()).await?)
+        // `GET /me/player` answers `204 No Content` when nothing is playing; `http_get_with`
+        // maps that to `None`.
+        self.http_get_with(
+            &format!("{SPOTIFY_API_ENDPOINT}/me/player"),
+            &Query::from([("additional_types", "track,episode")]),
+            rate_limit::Priority::High,
+        )
+        .await
     }
 
     /// Retrieve the latest playback state
