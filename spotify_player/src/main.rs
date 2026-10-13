@@ -180,6 +180,9 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         })?;
 
     if !state.is_daemon {
+        // The image picker must run before the terminal is set up: it queries the terminal on
+        // stdin and has to clean up after a query that is never answered before `init_terminal`
+        // reads a cursor position. See `ui::init_image_picker`.
         #[cfg(feature = "image")]
         ui::init_image_picker(state).context("initialize image picker")?;
         let terminal = ui::init_terminal().context("initialize terminal")?;

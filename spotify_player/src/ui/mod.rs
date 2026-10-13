@@ -83,13 +83,30 @@ pub fn init_terminal() -> Result<Terminal> {
 pub fn init_image_picker(state: &SharedState) -> Result<()> {
     let mut ui = state.ui.lock();
     crossterm::terminal::enable_raw_mode()?;
-    ui.picker = match ratatui_image::picker::Picker::from_query_stdio() {
+
+    // `Picker::from_query_stdio` reads the terminal's answer on a detached thread. Inside a
+    // terminal multiplexer the query is wrapped in a DCS passthrough that only a capable outer
+    // terminal ever sees, so when there is none the query stays unanswered: the picker gives up
+    // at its timeout, but that thread stays blocked on stdin. Left there it swallows the reply
+    // to the cursor query `init_terminal` waits for -- the startup failure under `tmux` -- and
+    // then the user's keystrokes, so unblock it before the terminal gets set up.
+    let options = ratatui_image::picker::cap_parser::QueryStdioOptions::default();
+    let query_timeout = options.timeout;
+    let query_started = std::time::Instant::now();
+    ui.picker = match ratatui_image::picker::Picker::from_query_stdio_with_options(options) {
         Ok(p) => p,
         Err(err) => {
             tracing::warn!("Failed to initialize query_stdio picker, error: {err:#}");
             ratatui_image::picker::Picker::halfblocks()
         }
     };
+    if query_started.elapsed() >= query_timeout {
+        unblock_picker_reader();
+    }
+
+    // The picker restores the terminal mode when its thread ends, which can happen after
+    // `init_terminal` has enabled raw mode; claiming the stored mode here makes that restore a
+    // no-op.
     crossterm::terminal::disable_raw_mode()?;
 
     // ratatui_image might detect the wrong protocol for iTerm2, so override it to the native iTerm2 protocol if detected
@@ -101,6 +118,18 @@ pub fn init_image_picker(state: &SharedState) -> Result<()> {
     }
     tracing::info!("Image protocol: {:?}", ui.picker.protocol_type());
     Ok(())
+}
+
+/// Sends one query that every terminal answers, so a reply-reading thread the picker may have
+/// left blocked on stdin reads something and exits. See [`init_image_picker`].
+#[cfg(feature = "image")]
+fn unblock_picker_reader() {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x1b[6n");
+    let _ = stdout.flush();
+    std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
 /// Whether the application is running inside iTerm2.
