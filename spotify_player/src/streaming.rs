@@ -275,27 +275,47 @@ pub async fn new_connection(
                     Ok(Some(event)) => {
                         tracing::info!("Got a new player event: {event:?}");
                         match &event {
-                            PlayerEvent::Playing { playable_id, .. } => {
-                                let mut player = state.player.write();
-                                player.streaming_track_id = Some(playable_id.uri());
-                                if let Some(playback) = player.buffered_playback.as_mut() {
-                                    playback.is_playing = true;
+                            PlayerEvent::Playing {
+                                playable_id,
+                                position_ms,
+                            } => {
+                                let uri = playable_id.uri();
+                                {
+                                    let mut player = state.player.write();
+                                    player.streaming_track_id = Some(uri.clone());
+                                    if let Some(playback) = player.buffered_playback.as_mut() {
+                                        playback.is_playing = true;
+                                    }
+                                    if let Some(bands) = &state.vis_bands {
+                                        bands.lock().is_active = true;
+                                    }
                                 }
-                                if let Some(bands) = &state.vis_bands {
-                                    bands.lock().is_active = true;
-                                }
+                                // The Web API may lag or be rate-limited, so keep the pane's item
+                                // and progress in sync with what librespot is actually playing.
+                                AppClient::reconcile_local_playback_item(
+                                    &state,
+                                    &uri,
+                                    Some(chrono::Duration::milliseconds(i64::from(*position_ms))),
+                                );
                             }
                             PlayerEvent::Paused { .. } => {
-                                let mut player = state.player.write();
-                                if let Some(playback) = player.buffered_playback.as_mut() {
-                                    playback.is_playing = false;
+                                {
+                                    let mut player = state.player.write();
+                                    if let Some(playback) = player.buffered_playback.as_mut() {
+                                        playback.is_playing = false;
+                                    }
+                                    if let Some(bands) = &state.vis_bands {
+                                        bands.lock().is_active = false;
+                                    }
                                 }
-                                if let Some(bands) = &state.vis_bands {
-                                    bands.lock().is_active = false;
-                                }
+                                // The pane stops advancing the progress once it knows playback
+                                // is paused locally, whatever the Web API last reported.
+                                AppClient::reconcile_local_playback_paused(&state);
                             }
                             PlayerEvent::Changed { playable_id } => {
-                                state.player.write().streaming_track_id = Some(playable_id.uri());
+                                let uri = playable_id.uri();
+                                state.player.write().streaming_track_id = Some(uri.clone());
+                                AppClient::reconcile_local_playback_item(&state, &uri, None);
                             }
                             PlayerEvent::EndOfTrack { .. } => {}
                         }

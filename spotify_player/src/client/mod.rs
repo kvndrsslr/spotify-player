@@ -15,6 +15,9 @@ use crate::{
         USER_TOP_TRACKS_URI,
     },
 };
+// Only the local (librespot) transport starts `Tracks` contexts directly.
+#[cfg(feature = "streaming")]
+use crate::state::TracksId;
 
 use std::io::Write;
 
@@ -73,6 +76,10 @@ pub struct AppClient {
     /// deliberate reconnect.
     #[cfg(feature = "streaming")]
     stream_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this session has already claimed the integrated device as the active one
+    /// (`activate()`), and thus whether librespot's own player commands can be used.
+    #[cfg(feature = "streaming")]
+    stream_claimed_active: Arc<std::sync::atomic::AtomicBool>,
     /// Guards the post-change playback poll so rapid player events coalesce into a single
     /// in-flight loop rather than flooding Spotify's Web API (which 429 rate-limits).
     update_playback_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -252,6 +259,718 @@ struct DevicesResponse {
 struct EpisodeImageInfo {
     url: String,
 }
+
+// ---------------------------------------------------------------------------------------------
+// Tolerant deserialization targets for Spotify's reduced response shapes.
+//
+// A newly registered client ID receives payloads that omit fields rspotify's models require
+// (`followers`/`genres`/`popularity` on artists, `popularity` on tracks and albums, `tracks` on
+// playlists, `item` instead of `track` in playlist entries). These local targets capture only
+// the fields the app uses, so one withheld non-essential field can no longer abort a whole list
+// or context fetch. When a field *is* present the extracted values are the same as rspotify's,
+// so other client IDs keep the same behaviour.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantArtist {
+    id: ArtistId<'static>,
+    name: String,
+}
+
+impl From<TolerantArtist> for Artist {
+    fn from(artist: TolerantArtist) -> Self {
+        Artist {
+            id: artist.id,
+            name: artist.name,
+        }
+    }
+}
+
+/// An artist as returned by `/artists/{id}`.
+///
+/// Only `name` and `genres` are read by the app (the playback pane's genre field), and the
+/// reduced shape carries no follower count, genres or popularity at all.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantFullArtist {
+    id: ArtistId<'static>,
+    name: String,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    followers: Option<TolerantFollowers>,
+    #[serde(default)]
+    popularity: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantFollowers {
+    #[serde(default)]
+    total: u32,
+}
+
+impl From<TolerantFullArtist> for rspotify::model::FullArtist {
+    fn from(artist: TolerantFullArtist) -> Self {
+        Self {
+            followers: rspotify::model::Followers {
+                total: artist.followers.map_or(0, |followers| followers.total),
+            },
+            genres: artist.genres,
+            id: artist.id,
+            name: artist.name,
+            popularity: artist.popularity.unwrap_or_default(),
+            // Not part of the app's artist model and never read for artists (only album and
+            // episode covers are rendered), so the reduced shape's `images` are ignored.
+            external_urls: HashMap::new(),
+            href: String::new(),
+            images: Vec::new(),
+        }
+    }
+}
+
+/// A cover image, as Spotify returns it.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantImage {
+    url: String,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    width: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantAlbum {
+    #[serde(default)]
+    id: Option<AlbumId<'static>>,
+    name: String,
+    #[serde(default)]
+    release_date: String,
+    #[serde(default)]
+    artists: Vec<TolerantArtist>,
+    #[serde(default)]
+    album_type: Option<String>,
+    /// The pane renders the currently playing item's cover, so these are kept.
+    #[serde(default)]
+    images: Vec<TolerantImage>,
+}
+
+impl TolerantAlbum {
+    fn into_album(self) -> Option<Album> {
+        Some(Album {
+            id: self.id?,
+            name: self.name,
+            release_date: self.release_date,
+            artists: self.artists.into_iter().map(Into::into).collect(),
+            typ: self.album_type.as_deref().and_then(album_type_from_str),
+            added_at: 0,
+        })
+    }
+}
+
+/// Mirrors rspotify's `album_type` string to [`rspotify::model::AlbumType`] mapping.
+fn album_type_from_str(album_type: &str) -> Option<rspotify::model::AlbumType> {
+    match album_type.to_ascii_lowercase().as_str() {
+        "album" => Some(rspotify::model::AlbumType::Album),
+        "single" => Some(rspotify::model::AlbumType::Single),
+        "appears_on" => Some(rspotify::model::AlbumType::AppearsOn),
+        "compilation" => Some(rspotify::model::AlbumType::Compilation),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantTrackLink {
+    #[serde(default)]
+    id: Option<TrackId<'static>>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantTrack {
+    #[serde(default)]
+    id: Option<TrackId<'static>>,
+    name: String,
+    #[serde(default)]
+    artists: Vec<TolerantArtist>,
+    #[serde(default)]
+    album: Option<TolerantAlbum>,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    explicit: bool,
+    #[serde(default)]
+    is_playable: Option<bool>,
+    #[serde(default)]
+    linked_from: Option<TolerantTrackLink>,
+}
+
+impl TolerantTrack {
+    /// Convert into the app's track, mirroring `Track::try_from_full_track` (honouring
+    /// `is_playable` and track relinking).
+    fn into_track(self, added_at: Option<chrono::DateTime<chrono::Utc>>) -> Option<Track> {
+        if !self.is_playable.unwrap_or(true) {
+            return None;
+        }
+        let id = match self.linked_from {
+            Some(link) => link.id?,
+            None => self.id?,
+        };
+        Some(Track {
+            id,
+            name: self.name,
+            artists: self.artists.into_iter().map(Into::into).collect(),
+            album: self.album.and_then(TolerantAlbum::into_album),
+            duration: std::time::Duration::from_millis(self.duration_ms),
+            explicit: self.explicit,
+            added_at: added_at.map(|t| t.timestamp() as u64).unwrap_or_default(),
+        })
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantShow {
+    id: ShowId<'static>,
+    name: String,
+    #[serde(default)]
+    publisher: String,
+    #[cfg(feature = "image")]
+    #[serde(default)]
+    images: Vec<EpisodeImageInfo>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantEpisode {
+    id: EpisodeId<'static>,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    release_date: String,
+    #[serde(default)]
+    show: Option<TolerantShow>,
+    #[cfg(feature = "image")]
+    #[serde(default)]
+    images: Vec<EpisodeImageInfo>,
+}
+
+impl From<TolerantEpisode> for Episode {
+    fn from(episode: TolerantEpisode) -> Self {
+        Self {
+            id: episode.id,
+            name: episode.name,
+            description: episode.description,
+            duration: std::time::Duration::from_millis(episode.duration_ms),
+            show: episode.show.map(|show| Show {
+                id: show.id,
+                name: show.name,
+                publisher: show.publisher,
+                #[cfg(feature = "image")]
+                image_url: show.images.first().map(|i| i.url.clone()),
+            }),
+            release_date: episode.release_date,
+            #[cfg(feature = "image")]
+            image_url: episode.images.first().map(|i| i.url.clone()),
+        }
+    }
+}
+
+/// Parse a playable item from raw JSON, tolerating the reduced shapes. Returns a real
+/// [`rspotify::model::PlayableItem`] (never `Unknown`) so the playback pane can display it.
+fn playable_item_from_value(value: &serde_json::Value) -> Option<rspotify::model::PlayableItem> {
+    match value.get("type").and_then(|typ| typ.as_str()) {
+        Some("episode") => {
+            let episode: TolerantEpisode = serde_json::from_value(value.clone()).ok()?;
+            app_episode_to_playable(&Episode::from(episode))
+        }
+        Some("track") => {
+            let track: TolerantTrack = serde_json::from_value(value.clone()).ok()?;
+            // The pane renders the currently playing item's cover, so the album images are
+            // carried over (the app's own track model has no image field).
+            let images = track.album.as_ref().map_or_else(Vec::new, |album| {
+                album
+                    .images
+                    .iter()
+                    .map(|image| rspotify::model::Image {
+                        url: image.url.clone(),
+                        height: image.height,
+                        width: image.width,
+                    })
+                    .collect()
+            });
+            let track = track.into_track(None)?;
+            let mut item = app_track_to_playable(&track);
+            if let rspotify::model::PlayableItem::Track(full_track) = &mut item {
+                full_track.album.images = images;
+            }
+            Some(item)
+        }
+        _ => None,
+    }
+}
+
+/// Like [`playable_item_from_value`], but keeps the raw JSON for anything that cannot be turned
+/// into a track or episode. This mirrors rspotify's own `PlayableItem` fallback, so local files
+/// and other shapes the reduced payloads cannot express still reach the UI (which renders them
+/// as blank rows) instead of disappearing from the queue.
+fn playable_item_from_value_or_unknown(value: &serde_json::Value) -> rspotify::model::PlayableItem {
+    playable_item_from_value(value)
+        .unwrap_or_else(|| rspotify::model::PlayableItem::Unknown(value.clone()))
+}
+
+/// A cursor-paginated list (`/me/following`, `/me/player/recently-played`).
+#[derive(Deserialize, Debug)]
+// `items` is defaulted, so the derive would otherwise demand `T: Default`; only `Deserialize`
+// is actually needed.
+#[serde(bound(deserialize = "T: serde::de::Deserialize<'de>"))]
+struct TolerantCursorPage<T> {
+    #[serde(default)]
+    items: Vec<T>,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+/// `/me/following?type=artist`.
+#[derive(Deserialize, Debug)]
+struct TolerantFollowedArtists {
+    artists: TolerantCursorPage<TolerantArtist>,
+}
+
+/// An entry of `/me/tracks` (and of the liked-tracks context).
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantSavedTrack {
+    track: TolerantTrack,
+    #[serde(default)]
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// An entry of `/me/albums`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantSavedAlbum {
+    album: TolerantAlbum,
+    #[serde(default)]
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The owner object of a playlist.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlaylistOwner {
+    #[serde(default)]
+    display_name: Option<String>,
+    id: UserId<'static>,
+}
+
+/// A playlist as returned by `/me/playlists`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantSimplifiedPlaylist {
+    id: PlaylistId<'static>,
+    #[serde(default)]
+    collaborative: bool,
+    name: String,
+    owner: TolerantPlaylistOwner,
+    #[serde(default)]
+    snapshot_id: String,
+}
+
+impl From<TolerantSimplifiedPlaylist> for Playlist {
+    fn from(playlist: TolerantSimplifiedPlaylist) -> Self {
+        // Mirrors rspotify's `SimplifiedPlaylist` conversion: the library list carries no
+        // description (it is filled in by the playlist detail fetch).
+        Self {
+            id: playlist.id,
+            name: playlist.name,
+            collaborative: playlist.collaborative,
+            owner: (
+                playlist.owner.display_name.unwrap_or_default(),
+                playlist.owner.id,
+            ),
+            desc: String::new(),
+            current_folder_id: 0,
+            snapshot_id: playlist.snapshot_id,
+        }
+    }
+}
+
+/// The `{ total }` of a track page; the reduced response moves it from `tracks` to `items`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantTrackTotal {
+    #[serde(default)]
+    total: u64,
+}
+
+/// A playlist as returned by `/playlists/{id}`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlaylistDetail {
+    id: PlaylistId<'static>,
+    #[serde(default)]
+    collaborative: bool,
+    name: String,
+    owner: TolerantPlaylistOwner,
+    #[serde(default, rename = "description")]
+    desc: String,
+    #[serde(default)]
+    snapshot_id: String,
+    /// Classic shape: the first page of tracks.
+    #[serde(default)]
+    tracks: Option<TolerantTrackTotal>,
+    /// Reduced shape: the same page under `items`.
+    #[serde(default)]
+    items: Option<TolerantTrackTotal>,
+}
+
+impl TolerantPlaylistDetail {
+    /// The playlist's track total, from either shape. `0` means "unknown", which the pagination
+    /// treats as "fetch until an empty page".
+    fn track_total(&self) -> usize {
+        self.tracks
+            .as_ref()
+            .or(self.items.as_ref())
+            .map_or(0, |page| page.total as usize)
+    }
+}
+
+impl From<TolerantPlaylistDetail> for Playlist {
+    fn from(playlist: TolerantPlaylistDetail) -> Self {
+        // Mirrors rspotify's `FullPlaylist` conversion: strip HTML tags from the description.
+        let re = regex::Regex::new("(<.*?>|</.*?>)").expect("valid regex");
+        let desc =
+            html_escape::decode_html_entities(&re.replace_all(&playlist.desc, "")).to_string();
+
+        Self {
+            id: playlist.id,
+            name: playlist.name,
+            collaborative: playlist.collaborative,
+            owner: (
+                playlist.owner.display_name.unwrap_or_default(),
+                playlist.owner.id,
+            ),
+            desc,
+            current_folder_id: 0,
+            snapshot_id: playlist.snapshot_id,
+        }
+    }
+}
+
+/// An entry of `/playlists/{id}/items`. The reduced response names the item `item`; the classic
+/// shape names it `track`. The item stays raw so its `type` can be checked (episodes are not
+/// tracks) and so a track with withheld fields still converts.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlaylistItem {
+    #[serde(default)]
+    added_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, alias = "track")]
+    item: Option<serde_json::Value>,
+}
+
+impl TolerantPlaylistItem {
+    /// Convert into the app's track. Episodes are not tracks, and unplayable tracks and local
+    /// files without an id yield `None`, so they are skipped as before.
+    fn into_track(self) -> Option<Track> {
+        let item = self.item?;
+        if item.get("type").and_then(|typ| typ.as_str()) != Some("track") {
+            return None;
+        }
+        serde_json::from_value::<TolerantTrack>(item)
+            .ok()?
+            .into_track(self.added_at)
+    }
+}
+
+/// An album as returned by `/albums/{id}`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantAlbumDetail {
+    #[serde(default)]
+    id: Option<AlbumId<'static>>,
+    name: String,
+    #[serde(default)]
+    release_date: String,
+    #[serde(default)]
+    artists: Vec<TolerantArtist>,
+    #[serde(default)]
+    album_type: Option<String>,
+    #[serde(default)]
+    total_tracks: u64,
+    #[serde(default)]
+    tracks: Option<TolerantTrackTotal>,
+}
+
+impl TolerantAlbumDetail {
+    /// The album's track total, from either `total_tracks` or the embedded page.
+    fn track_total(&self) -> usize {
+        match self.tracks.as_ref() {
+            Some(page) if page.total > 0 => page.total as usize,
+            _ => self.total_tracks as usize,
+        }
+    }
+
+    fn into_album(self) -> Option<Album> {
+        TolerantAlbum {
+            id: self.id,
+            name: self.name,
+            release_date: self.release_date,
+            artists: self.artists,
+            album_type: self.album_type,
+            // the app's album model has no cover field, so they are not carried further
+            images: Vec::new(),
+        }
+        .into_album()
+    }
+}
+
+/// An entry of `/me/player/recently-played`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlayHistory {
+    track: TolerantTrack,
+}
+
+/// The device object of `/me/player`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlaybackDevice {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    is_active: bool,
+    #[serde(default)]
+    is_private_session: bool,
+    #[serde(default)]
+    is_restricted: bool,
+    name: String,
+    #[serde(default, rename = "type")]
+    device_type: Option<rspotify::model::DeviceType>,
+    #[serde(default)]
+    volume_percent: Option<u32>,
+}
+
+impl From<TolerantPlaybackDevice> for rspotify::model::Device {
+    fn from(device: TolerantPlaybackDevice) -> Self {
+        Self {
+            id: device.id,
+            is_active: device.is_active,
+            is_private_session: device.is_private_session,
+            is_restricted: device.is_restricted,
+            name: device.name,
+            _type: device
+                .device_type
+                .unwrap_or(rspotify::model::DeviceType::Speaker),
+            volume_percent: device.volume_percent,
+        }
+    }
+}
+
+/// The context object of `/me/player`.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlaybackContext {
+    uri: String,
+    #[serde(default, rename = "type")]
+    context_type: Option<rspotify::model::Type>,
+}
+
+/// `/me/player`. `item` is kept raw so a withheld `popularity`/`external_ids` field cannot make
+/// the whole response unparseable; [`playable_item_from_value`] then rebuilds a real item.
+#[derive(Deserialize, Debug, Clone)]
+struct TolerantPlayback {
+    #[serde(default)]
+    device: Option<TolerantPlaybackDevice>,
+    #[serde(default)]
+    repeat_state: Option<rspotify::model::RepeatState>,
+    #[serde(default)]
+    shuffle_state: bool,
+    #[serde(default)]
+    context: Option<TolerantPlaybackContext>,
+    #[serde(default, rename = "progress_ms")]
+    progress_ms: Option<u64>,
+    #[serde(default)]
+    is_playing: bool,
+    #[serde(default)]
+    item: Option<serde_json::Value>,
+    /// The payload's epoch-milliseconds `timestamp`, converted like rspotify does.
+    #[serde(default, rename = "timestamp")]
+    timestamp_ms: Option<i64>,
+    /// Usually present; inferred from `item` when absent.
+    #[serde(default)]
+    currently_playing_type: Option<rspotify::model::CurrentlyPlayingType>,
+}
+
+impl TolerantPlayback {
+    fn into_current_playback(self) -> rspotify::model::CurrentPlaybackContext {
+        let item = self.item.as_ref().map(playable_item_from_value_or_unknown);
+        let currently_playing_type = self.currently_playing_type.unwrap_or_else(|| {
+            item.as_ref().map_or(
+                rspotify::model::CurrentlyPlayingType::Unknown,
+                playing_type_of,
+            )
+        });
+        let context = self.context.map(|context| rspotify::model::Context {
+            _type: context
+                .context_type
+                .unwrap_or_else(|| context_type_from_uri(&context.uri)),
+            uri: context.uri,
+            href: String::new(),
+            external_urls: HashMap::new(),
+        });
+        let device = self.device.map_or_else(
+            || rspotify::model::Device {
+                id: None,
+                is_active: true,
+                is_private_session: false,
+                is_restricted: false,
+                name: config::get_config().app_config.device.name.clone(),
+                _type: rspotify::model::DeviceType::Speaker,
+                volume_percent: Some(u32::from(config::get_config().app_config.device.volume)),
+            },
+            Into::into,
+        );
+
+        rspotify::model::CurrentPlaybackContext {
+            device,
+            repeat_state: self
+                .repeat_state
+                .unwrap_or(rspotify::model::RepeatState::Off),
+            shuffle_state: self.shuffle_state,
+            context,
+            timestamp: self
+                .timestamp_ms
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .unwrap_or_else(chrono::Utc::now),
+            progress: self
+                .progress_ms
+                .map(|ms| chrono::Duration::milliseconds(ms as i64)),
+            is_playing: self.is_playing,
+            item,
+            currently_playing_type,
+            actions: rspotify::model::Actions::default(),
+        }
+    }
+}
+
+/// `/me/player/queue`.
+#[derive(Deserialize, Debug)]
+struct TolerantQueue {
+    #[serde(default)]
+    currently_playing: Option<serde_json::Value>,
+    #[serde(default)]
+    queue: Vec<serde_json::Value>,
+}
+
+impl TolerantQueue {
+    fn into_current_user_queue(self) -> rspotify::model::CurrentUserQueue {
+        rspotify::model::CurrentUserQueue {
+            currently_playing: self
+                .currently_playing
+                .as_ref()
+                .map(playable_item_from_value_or_unknown),
+            queue: self
+                .queue
+                .iter()
+                .map(playable_item_from_value_or_unknown)
+                .collect(),
+        }
+    }
+}
+
+/// The Web API `Type` implied by a context URI.
+fn context_type_from_uri(uri: &str) -> rspotify::model::Type {
+    match uri.split(':').nth(1) {
+        Some("album") => rspotify::model::Type::Album,
+        Some("artist") => rspotify::model::Type::Artist,
+        Some("show") => rspotify::model::Type::Show,
+        Some("playlist") => rspotify::model::Type::Playlist,
+        _ => rspotify::model::Type::Collection,
+    }
+}
+
+/// Warn once per session that a best-effort artist sub-resource is unavailable.
+///
+/// A reduced app registration is refused (`top-tracks` answers 403) and the `related-artists`
+/// endpoint no longer exists; the artist page reloads on every navigation, so warning each time
+/// would turn a stable refusal into a log storm.
+fn warn_once_unavailable(once: &std::sync::Once, what: &str, err: &anyhow::Error) {
+    once.call_once(|| {
+        tracing::warn!("Not showing the artist's {what}, continuing without it: {err:#}");
+    });
+}
+
+static ARTIST_TOP_TRACKS_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
+static ARTIST_ALBUMS_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
+static ARTIST_RELATED_ARTISTS_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
+
+/// How a player request is executed.
+#[cfg(feature = "streaming")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// Executed on the integrated (librespot) player. No Web API request is made, and the device
+    /// is already the active one, so nothing is claimed or transferred.
+    Integrated,
+    /// Sent to the Web API, exactly as it was before the local transport existed.
+    WebApi,
+    /// The Web API is tried first; when that call fails, the request is executed on the
+    /// integrated player instead, which claims the device with `activate()`.
+    WebApiWithLocalFallback,
+}
+
+/// Decide how `request` is executed.
+///
+/// - The integrated device is the active one: `Integrated`, so playback commands keep working
+///   while the Web API is rate-limited, and no device ownership changes.
+/// - Any other device, or no known one, is active: the Web API, unchanged. Only an explicit
+///   "start playback" request that the Web API *failed* to serve falls back to the integrated
+///   player; that is the quota-outage case and the only one where the local player claims a
+///   device that is not already active.
+///
+/// `web_api_failed` is the second input of the fallback rule: the first attempt asks with
+/// `false`, and the retry decision after a failed attempt asks with `true`.
+#[cfg(feature = "streaming")]
+fn transport_for(
+    request: &PlayerRequest,
+    integrated_is_active: bool,
+    web_api_failed: bool,
+) -> Transport {
+    if integrated_is_active {
+        return Transport::Integrated;
+    }
+    let explicit_playback_start = matches!(request, PlayerRequest::StartPlayback(..));
+    if explicit_playback_start && web_api_failed {
+        Transport::WebApiWithLocalFallback
+    } else {
+        Transport::WebApi
+    }
+}
+
+/// Whether a failed Web API command looks like a rate-limit or connectivity problem, i.e. the
+/// kind of failure the integrated player can work around by taking over locally.
+///
+/// rspotify reports both as `ClientError::Http`: transport failures as `HttpError::Client`, and
+/// HTTP statuses (the 429 of the rate limiter, or a 5xx) as `HttpError::StatusCode`. Errors from
+/// the app's own paced HTTP layer name the condition in their message instead.
+#[cfg(feature = "streaming")]
+fn is_transient_api_failure(err: &anyhow::Error) -> bool {
+    if let Some(rspotify::ClientError::Http(http)) = err.downcast_ref::<rspotify::ClientError>() {
+        return match &**http {
+            rspotify::http::HttpError::Client(_) => true,
+            rspotify::http::HttpError::StatusCode(response) => {
+                let status = response.status().as_u16();
+                status == 429 || status == 408 || (500..=599).contains(&status)
+            }
+        };
+    }
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("rate-limited") || text.contains("rate limited") || text.contains("429")
+}
+
+/// Whether a local playback fallback has already been logged at info level in this session;
+/// later fallbacks stay at debug level so a long outage cannot flood the log.
+#[cfg(feature = "streaming")]
+static LOCAL_FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `CurrentlyPlayingType` implied by a playable item.
+fn playing_type_of(item: &rspotify::model::PlayableItem) -> rspotify::model::CurrentlyPlayingType {
+    match item {
+        rspotify::model::PlayableItem::Track(_) => rspotify::model::CurrentlyPlayingType::Track,
+        rspotify::model::PlayableItem::Episode(_) => rspotify::model::CurrentlyPlayingType::Episode,
+        rspotify::model::PlayableItem::Unknown(_) => rspotify::model::CurrentlyPlayingType::Unknown,
+    }
+}
+
 impl AppClient {
     /// Construct a new client
     pub async fn new() -> Result<Self> {
@@ -297,6 +1016,8 @@ impl AppClient {
             stream_drop_rx,
             #[cfg(feature = "streaming")]
             stream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "streaming")]
+            stream_claimed_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             update_playback_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             context_fetch_in_flight: Arc::new(parking_lot::Mutex::default()),
             #[cfg(feature = "image")]
@@ -689,6 +1410,430 @@ impl AppClient {
         }
     }
 
+    /// Run a synchronous command on the integrated (librespot) connection.
+    ///
+    /// Every `Spirc` command is a synchronous send on an unbounded channel, so the lock is never
+    /// held across an `await`. Returns `false` when there is no connection or the command could
+    /// not be queued (channel closed).
+    #[cfg(feature = "streaming")]
+    fn with_spirc(&self, f: impl FnOnce(&librespot_connect::Spirc) -> bool) -> bool {
+        match self.stream_conn.lock().as_ref() {
+            Some(spirc) => f(spirc),
+            None => false,
+        }
+    }
+
+    /// Claim the integrated device as the active one, at most once per session.
+    ///
+    /// Requests are routed to the local player only while the Web API reports this device as the
+    /// active one, and librespot normally learns that from the same connect-state updates (a
+    /// transfer addressed to it activates it). The claim closes the remaining gap - notably an
+    /// app restart while this device was already the active one, where librespot would otherwise
+    /// ignore player commands - and is issued at most once per session because librespot logs a
+    /// warning when it is asked to activate while it already considers itself active.
+    ///
+    /// `false` when there is no librespot connection to command.
+    #[cfg(feature = "streaming")]
+    fn ensure_local_device_claimed(&self) -> bool {
+        if self
+            .stream_claimed_active
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        if !self.with_spirc(|spirc| spirc.activate().is_ok()) {
+            return false;
+        }
+        self.stream_claimed_active
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+
+    /// Apply a local (spirc) change to the player state: the rich `playback` (item/context/
+    /// progress) and the buffered metadata that `current_playback()` overlays for display.
+    #[cfg(feature = "streaming")]
+    fn apply_local_playback_change(
+        state: &SharedState,
+        playback: impl FnOnce(&mut rspotify::model::CurrentPlaybackContext),
+        metadata: impl FnOnce(&mut PlaybackMetadata),
+    ) {
+        let mut player = state.player.write();
+        if let Some(p) = player.playback.as_mut() {
+            playback(p);
+        }
+        if let Some(m) = player.buffered_playback.as_mut() {
+            metadata(m);
+        }
+        player.playback_last_updated_time = Some(std::time::Instant::now());
+    }
+
+    /// Publish a locally started playback into the player state.
+    ///
+    /// The Web API cannot refresh `/me/player` while it is rate-limited, so the pane would
+    /// otherwise show "No playback found" while audio plays. Everything here is derived from
+    /// local truth (the requested item, the caches, the configured device).
+    #[cfg(feature = "streaming")]
+    fn publish_local_playback(
+        state: &SharedState,
+        device_id: &str,
+        item_uri: Option<&str>,
+        context: Option<(String, rspotify::model::Type)>,
+        shuffle: bool,
+    ) {
+        let configs = config::get_config();
+        let device_name = configs.app_config.device.name.clone();
+        let volume = u32::from(std::cmp::min(configs.app_config.device.volume, 100));
+
+        let item = item_uri.and_then(|uri| playback_item_for_uri(state, uri));
+        let currently_playing_type = item.as_ref().map_or(
+            rspotify::model::CurrentlyPlayingType::Unknown,
+            playing_type_of,
+        );
+
+        let repeat_state = state
+            .player
+            .read()
+            .buffered_playback
+            .as_ref()
+            .map_or(rspotify::model::RepeatState::Off, |buffered| {
+                buffered.repeat_state
+            });
+
+        let playback = rspotify::model::CurrentPlaybackContext {
+            device: rspotify::model::Device {
+                id: Some(device_id.to_string()),
+                is_active: true,
+                is_private_session: false,
+                is_restricted: false,
+                name: device_name.clone(),
+                // The configured device type is a librespot string; the pane only displays the
+                // device name, so the speaker default is used here.
+                _type: rspotify::model::DeviceType::Speaker,
+                volume_percent: Some(volume),
+            },
+            repeat_state,
+            shuffle_state: shuffle,
+            context: context.map(|(uri, context_type)| rspotify::model::Context {
+                uri,
+                href: String::new(),
+                external_urls: HashMap::new(),
+                _type: context_type,
+            }),
+            timestamp: chrono::Utc::now(),
+            progress: Some(chrono::Duration::zero()),
+            is_playing: true,
+            item,
+            currently_playing_type,
+            actions: rspotify::model::Actions::default(),
+        };
+
+        let mut player = state.player.write();
+        player.playback = Some(playback);
+        player.playback_last_updated_time = Some(std::time::Instant::now());
+        player.buffered_playback = Some(PlaybackMetadata {
+            device_name,
+            device_id: Some(device_id.to_string()),
+            volume: Some(volume),
+            // the playback was just started on the local player
+            is_playing: true,
+            repeat_state,
+            shuffle_state: shuffle,
+            mute_state: None,
+        });
+    }
+
+    /// Reconcile the pane with what the integrated (librespot) player is doing.
+    ///
+    /// librespot is the local truth for playback: the Web API's view can lag behind it, and it
+    /// is simply unavailable while rate-limited. Called from the player-event loop, which is a
+    /// state change of its own, so it never logs per poll - a failure to resolve the item is
+    /// logged once per event at debug level.
+    #[cfg(feature = "streaming")]
+    pub(crate) fn reconcile_local_playback_item(
+        state: &SharedState,
+        uri: &str,
+        position: Option<chrono::Duration>,
+    ) {
+        let Some(item) = playback_item_for_uri(state, uri) else {
+            tracing::debug!("No cached metadata for locally playing item {uri}");
+            return;
+        };
+        let currently_playing_type = playing_type_of(&item);
+
+        let mut player = state.player.write();
+        if let Some(playback) = player.playback.as_mut() {
+            let shows_item = playback
+                .item
+                .as_ref()
+                .and_then(rspotify::model::PlayableItem::id)
+                .is_some_and(|id| id.uri() == uri);
+            if !shows_item {
+                playback.item = Some(item);
+                playback.currently_playing_type = currently_playing_type;
+            }
+            playback.is_playing = true;
+            // The event carries the position librespot is playing from (a track start, a
+            // resume after a pause, or a corrected position after a seek), so the progress
+            // display follows the audio rather than the last Web API read.
+            playback.progress = Some(position.unwrap_or_else(chrono::Duration::zero));
+        }
+        if let Some(metadata) = player.buffered_playback.as_mut() {
+            metadata.is_playing = true;
+        }
+        player.playback_last_updated_time = Some(std::time::Instant::now());
+    }
+
+    /// Mark the pane's playback state as paused, from librespot's `Paused` event, so the
+    /// progress display stops advancing while the Web API's view is stale or unavailable.
+    #[cfg(feature = "streaming")]
+    pub(crate) fn reconcile_local_playback_paused(state: &SharedState) {
+        Self::apply_local_playback_change(
+            state,
+            |playback| playback.is_playing = false,
+            |metadata| metadata.is_playing = false,
+        );
+    }
+
+    /// Serve `request` on the integrated player.
+    ///
+    /// Only called while this process' device is the active one (`transport_for`), so the local
+    /// player owns the playback state and no device is transferred. Returns `false` when the
+    /// local player cannot serve the request - no librespot connection, or a context whose
+    /// tracks are not cached locally - which leaves the request to the Web API.
+    #[cfg(feature = "streaming")]
+    async fn handle_local_player_request(
+        &self,
+        state: &SharedState,
+        request: &PlayerRequest,
+        buffered: Option<&PlaybackMetadata>,
+    ) -> bool {
+        if !self.ensure_local_device_claimed() {
+            return false;
+        }
+
+        match request {
+            PlayerRequest::StartPlayback(playback, shuffle) => {
+                let shuffle = shuffle
+                    .or_else(|| buffered.map(|playback| playback.shuffle_state))
+                    .unwrap_or(false);
+                let Some(load) = local_load(state, playback, shuffle) else {
+                    return false;
+                };
+                if !self.with_spirc(|spirc| spirc.load(load.request).is_ok()) {
+                    return false;
+                }
+
+                let device_id = self.spotify.session().await.device_id().to_string();
+                Self::publish_local_playback(
+                    state,
+                    &device_id,
+                    load.item_uri.as_deref(),
+                    load.context,
+                    shuffle,
+                );
+                true
+            }
+            PlayerRequest::Pause => {
+                if !self.with_spirc(|spirc| spirc.pause().is_ok()) {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.is_playing = false,
+                    |m| m.is_playing = false,
+                );
+                true
+            }
+            PlayerRequest::Resume => {
+                if !self.with_spirc(|spirc| spirc.play().is_ok()) {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.is_playing = true,
+                    |m| m.is_playing = true,
+                );
+                true
+            }
+            PlayerRequest::ResumePause => {
+                if !self.with_spirc(|spirc| spirc.play_pause().is_ok()) {
+                    return false;
+                }
+                let now_playing = !buffered.is_some_and(|playback| playback.is_playing);
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.is_playing = now_playing,
+                    |m| m.is_playing = now_playing,
+                );
+                true
+            }
+            PlayerRequest::NextTrack => {
+                if !self.with_spirc(|spirc| spirc.next().is_ok()) {
+                    return false;
+                }
+                // The new track is announced by the librespot player-event loop, which
+                // re-resolves the item; only the progress is reset here.
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.progress = Some(chrono::Duration::zero()),
+                    |_| {},
+                );
+                true
+            }
+            PlayerRequest::PreviousTrack => {
+                if !self.with_spirc(|spirc| spirc.prev().is_ok()) {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.progress = Some(chrono::Duration::zero()),
+                    |_| {},
+                );
+                true
+            }
+            PlayerRequest::SeekTrack(position) => {
+                let position_ms = u32::try_from(position.num_milliseconds()).unwrap_or(u32::MAX);
+                if !self.with_spirc(|spirc| spirc.set_position_ms(position_ms).is_ok()) {
+                    return false;
+                }
+                Self::apply_local_playback_change(state, |p| p.progress = Some(*position), |_| {});
+                true
+            }
+            PlayerRequest::Repeat => {
+                let current = buffered.map_or(rspotify::model::RepeatState::Off, |playback| {
+                    playback.repeat_state
+                });
+                let next = match current {
+                    rspotify::model::RepeatState::Off => rspotify::model::RepeatState::Track,
+                    rspotify::model::RepeatState::Track => rspotify::model::RepeatState::Context,
+                    rspotify::model::RepeatState::Context => rspotify::model::RepeatState::Off,
+                };
+                let (repeat_context, repeat_track) = match next {
+                    rspotify::model::RepeatState::Off => (false, false),
+                    rspotify::model::RepeatState::Track => (false, true),
+                    rspotify::model::RepeatState::Context => (true, false),
+                };
+                if !self.with_spirc(|spirc| {
+                    spirc.repeat(repeat_context).is_ok() && spirc.repeat_track(repeat_track).is_ok()
+                }) {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.repeat_state = next,
+                    |m| m.repeat_state = next,
+                );
+                true
+            }
+            PlayerRequest::Shuffle => {
+                let next = !buffered.is_some_and(|playback| playback.shuffle_state);
+                if !self.with_spirc(|spirc| spirc.shuffle(next).is_ok()) {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.shuffle_state = next,
+                    |m| m.shuffle_state = next,
+                );
+                true
+            }
+            PlayerRequest::Volume(volume) => {
+                if !self.with_spirc(|spirc| spirc.set_volume(volume_to_librespot(*volume)).is_ok())
+                {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.device.volume_percent = Some(u32::from(*volume)),
+                    |m| {
+                        m.volume = Some(u32::from(*volume));
+                        m.mute_state = None;
+                    },
+                );
+                state.ui.lock().volume_target = None;
+                true
+            }
+            PlayerRequest::ToggleMute => {
+                let (volume_percent, new_mute_state) = match buffered.and_then(|p| p.mute_state) {
+                    None => (0, Some(buffered.and_then(|p| p.volume).unwrap_or_default())),
+                    Some(restore) => (u8::try_from(restore).unwrap_or(u8::MAX), None),
+                };
+                if !self.with_spirc(|spirc| {
+                    spirc
+                        .set_volume(volume_to_librespot(volume_percent))
+                        .is_ok()
+                }) {
+                    return false;
+                }
+                Self::apply_local_playback_change(
+                    state,
+                    |p| p.device.volume_percent = Some(u32::from(volume_percent)),
+                    |m| {
+                        m.volume = Some(u32::from(volume_percent));
+                        m.mute_state = new_mute_state;
+                    },
+                );
+                true
+            }
+            // `TransferPlayback` keeps the Web API behaviour.
+            PlayerRequest::TransferPlayback(..) => false,
+        }
+    }
+
+    /// Execute a playback start on the integrated player after the Web API failed to serve it.
+    ///
+    /// This is the quota-outage path: the command could not be delivered, so the local player
+    /// takes over instead. Another device may own playback at that moment (or none is known),
+    /// hence the device is claimed unconditionally here - unlike the already-active case, where
+    /// the claim happens at most once per session. Returns `false` when the local player cannot
+    /// serve the request, leaving the original error to the caller.
+    #[cfg(feature = "streaming")]
+    async fn start_local_playback(
+        &self,
+        state: &SharedState,
+        request: &PlayerRequest,
+        buffered: Option<&PlaybackMetadata>,
+        err: &anyhow::Error,
+    ) -> bool {
+        let PlayerRequest::StartPlayback(playback, shuffle) = request else {
+            return false;
+        };
+        let shuffle = shuffle
+            .or_else(|| buffered.map(|playback| playback.shuffle_state))
+            .unwrap_or(false);
+        let Some(load) = local_load(state, playback, shuffle) else {
+            return false;
+        };
+        if !self.with_spirc(|spirc| spirc.activate().is_ok() && spirc.load(load.request).is_ok()) {
+            return false;
+        }
+        self.stream_claimed_active
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // One info log per session, then debug: an outage lasting longer than the session must
+        // not flood the log.
+        if LOCAL_FALLBACK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                "Web API playback start failed again, started on the integrated device instead: {err:#}"
+            );
+        } else {
+            tracing::info!(
+                "Web API playback start failed, falling back to the integrated device (which \
+                 becomes the active device): {err:#}"
+            );
+        }
+
+        let device_id = self.spotify.session().await.device_id().to_string();
+        Self::publish_local_playback(
+            state,
+            &device_id,
+            load.item_uri.as_deref(),
+            load.context,
+            shuffle,
+        );
+        true
+    }
+
     /// Handle a player request, return a new playback metadata on success
     pub async fn handle_player_request(
         &self,
@@ -1075,8 +2220,52 @@ impl AppClient {
                     PlayerRequest::SeekTrack(position) => Some(*position),
                     _ => None,
                 };
-                let playback = state.player.read().buffered_playback.clone();
-                let playback = self.handle_player_request(request, playback).await?;
+                let buffered = state.player.read().buffered_playback.clone();
+
+                // The integrated device is served by its own transport, so those commands never
+                // reach the Web API; every other device keeps the Web API path.
+                // (`transport_for` documents the exact rules.)
+                #[cfg(feature = "streaming")]
+                let active_device = buffered.as_ref().and_then(|p| p.device_id.as_deref());
+                #[cfg(feature = "streaming")]
+                let integrated_is_active = self.active_device_is_integrated(active_device).await;
+
+                #[cfg(feature = "streaming")]
+                if transport_for(&request, integrated_is_active, false) == Transport::Integrated
+                    && self
+                        .handle_local_player_request(state, &request, buffered.as_ref())
+                        .await
+                {
+                    return Ok(());
+                }
+
+                // An explicit playback start that the Web API cannot serve may still run on the
+                // integrated player, so its arguments are kept for that path.
+                #[cfg(feature = "streaming")]
+                let local_fallback = (transport_for(&request, integrated_is_active, true)
+                    == Transport::WebApiWithLocalFallback)
+                    .then(|| (request.clone(), buffered.clone()));
+
+                let web_api_result = self.handle_player_request(request, buffered).await;
+                let playback = match web_api_result {
+                    Ok(playback) => playback,
+                    Err(err) => {
+                        // Quota outage or connectivity: the command still happens, on the
+                        // integrated device. Anything else keeps failing exactly as before.
+                        #[cfg(feature = "streaming")]
+                        if let Some((request, buffered)) = local_fallback.as_ref() {
+                            if is_transient_api_failure(&err)
+                                && self
+                                    .start_local_playback(state, request, buffered.as_ref(), &err)
+                                    .await
+                            {
+                                return Ok(());
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+
                 state.player.write().buffered_playback = playback;
                 if is_volume {
                     // The commanded target is now applied locally; drop the pending rebase
@@ -1351,12 +2540,20 @@ impl AppClient {
             // the track the local stream is actually playing; bounded so nothing polls
             // forever.
             let mut attempts = 0u32;
+            let mut logged_failure = false;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if let Err(err) = client.retrieve_current_playback(&state, false).await {
-                    tracing::error!(
-                        "Encountered an error when updating the playback state: {err:#}"
-                    );
+                    // One log line per poll run: an outage lasting the whole loop (up to 30
+                    // attempts) must not produce 30 identical lines.
+                    if logged_failure {
+                        tracing::debug!("Playback state still failing to update: {err:#}");
+                    } else {
+                        tracing::error!(
+                            "Encountered an error when updating the playback state: {err:#}"
+                        );
+                        logged_failure = true;
+                    }
                 }
                 attempts += 1;
 
@@ -1539,7 +2736,7 @@ impl AppClient {
     /// [`rate_limit::Priority::Background`] fetch was deferred.
     pub async fn saved_tracks(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Track>>> {
         let Some(tracks) = self
-            .all_paging_items_optional::<rspotify::model::SavedTrack>(
+            .all_paging_items_optional::<TolerantSavedTrack>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/tracks"),
                 0, // we don't know the total number of saved tracks beforehand
                 priority,
@@ -1552,7 +2749,7 @@ impl AppClient {
         Ok(Some(
             tracks
                 .into_iter()
-                .filter_map(|t| Track::try_from_full_track(t.track))
+                .filter_map(|t| t.track.into_track(t.added_at))
                 .collect(),
         ))
     }
@@ -1564,7 +2761,7 @@ impl AppClient {
         priority: rate_limit::Priority,
     ) -> Result<Option<Vec<Track>>> {
         let Some(first_page) = self
-            .http_get_optional::<rspotify::model::CursorBasedPage<rspotify::model::PlayHistory>>(
+            .http_get_optional::<TolerantCursorPage<TolerantPlayHistory>>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/player/recently-played"),
                 &Query::from([("limit", "50")]),
                 priority,
@@ -1584,8 +2781,8 @@ impl AppClient {
         // de-duplicate the tracks returned from the recently-played API
         let mut tracks = Vec::<Track>::new();
         for history in play_histories {
-            if !tracks.iter().any(|t| t.name == history.track.name) {
-                if let Some(track) = Track::try_from_full_track(history.track) {
+            if let Some(track) = history.track.into_track(None) {
+                if !tracks.iter().any(|t| t.name == track.name) {
                     tracks.push(track);
                 }
             }
@@ -1605,7 +2802,7 @@ impl AppClient {
     /// [`rate_limit::Priority::Background`] fetch was deferred.
     pub async fn top_tracks(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Track>>> {
         let Some(tracks) = self
-            .all_paging_items_optional::<rspotify::model::FullTrack>(
+            .all_paging_items_optional::<TolerantTrack>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/top/tracks"),
                 0, // we don't know the total number of top tracks beforehand
                 priority,
@@ -1618,7 +2815,7 @@ impl AppClient {
         Ok(Some(
             tracks
                 .into_iter()
-                .filter_map(Track::try_from_full_track)
+                .filter_map(|t| t.into_track(None))
                 .collect(),
         ))
     }
@@ -1638,7 +2835,7 @@ impl AppClient {
         priority: rate_limit::Priority,
     ) -> Result<Option<Vec<Playlist>>> {
         let Some(playlists) = self
-            .all_paging_items_optional::<rspotify::model::SimplifiedPlaylist>(
+            .all_paging_items_optional::<TolerantSimplifiedPlaylist>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/playlists"),
                 0, // we don't know the total number of playlists beforehand
                 priority,
@@ -1672,7 +2869,7 @@ impl AppClient {
     ) -> Result<Option<Vec<Artist>>> {
         // Inherent fetch (throttled + 429-handled) instead of rspotify's unthrottled call.
         let Some(first_page) = self
-            .http_get_optional::<rspotify::model::CursorPageFullArtists>(
+            .http_get_optional::<TolerantFollowedArtists>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/following"),
                 &Query::from([("type", "artist"), ("limit", "50")]),
                 priority,
@@ -1689,11 +2886,7 @@ impl AppClient {
         let mut maybe_next = first_page.next;
         while let Some(url) = maybe_next {
             let Some(next_page) = self
-                .http_get_optional::<rspotify::model::CursorPageFullArtists>(
-                    &url,
-                    &Query::new(),
-                    priority,
-                )
+                .http_get_optional::<TolerantFollowedArtists>(&url, &Query::new(), priority)
                 .await?
             else {
                 return Ok(None);
@@ -1703,10 +2896,7 @@ impl AppClient {
             maybe_next = next_page.next;
         }
 
-        // converts `rspotify::model::FullArtist` into `state::Artist`
-        Ok(Some(
-            artists.into_iter().map(std::convert::Into::into).collect(),
-        ))
+        Ok(Some(artists.into_iter().map(Into::into).collect()))
     }
 
     /// Get the current user's playback queue.
@@ -1714,12 +2904,14 @@ impl AppClient {
     /// Inherent so it goes through the throttled [`Self::http_get_with`] layer instead of
     /// rspotify.
     pub async fn current_user_queue(&self) -> Result<rspotify::model::CurrentUserQueue> {
-        self.http_get_with(
-            &format!("{SPOTIFY_API_ENDPOINT}/me/player/queue"),
-            &Query::new(),
-            rate_limit::Priority::High,
-        )
-        .await
+        let queue = self
+            .http_get_with::<TolerantQueue>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/player/queue"),
+                &Query::new(),
+                rate_limit::Priority::High,
+            )
+            .await?;
+        Ok(queue.into_current_user_queue())
     }
 
     /// Get all saved albums of the current user
@@ -1734,7 +2926,7 @@ impl AppClient {
     /// [`rate_limit::Priority::Background`] fetch was deferred.
     pub async fn saved_albums(&self, priority: rate_limit::Priority) -> Result<Option<Vec<Album>>> {
         let Some(albums) = self
-            .all_paging_items_optional::<rspotify::model::SavedAlbum>(
+            .all_paging_items_optional::<TolerantSavedAlbum>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/albums"),
                 0, // we don't know the total number of saved albums beforehand
                 priority,
@@ -1744,8 +2936,19 @@ impl AppClient {
             return Ok(None);
         };
 
-        // Converts `rspotify::model::SavedAlbum` into `state::Album`
-        Ok(Some(albums.into_iter().map(Album::from).collect()))
+        // Converts the saved album entries into `state::Album`
+        Ok(Some(
+            albums
+                .into_iter()
+                .filter_map(|saved| {
+                    let added_at = saved.added_at.map_or(0, |t| t.timestamp() as u64);
+                    saved.album.into_album().map(|mut album| {
+                        album.added_at = added_at;
+                        album
+                    })
+                })
+                .collect(),
+        ))
     }
 
     /// Get the saved shows at `priority`; `Ok(None)` when a
@@ -2238,25 +3441,26 @@ impl AppClient {
         tracing::info!("Get playlist context: {}", playlist_uri);
 
         let playlist = self
-            .http_get_with::<rspotify::model::FullPlaylist>(
+            .http_get_with::<TolerantPlaylistDetail>(
                 &format!("{SPOTIFY_API_ENDPOINT}/playlists/{}", playlist_id.id()),
                 &Query::from([("market", "from_token")]),
                 rate_limit::Priority::Normal,
             )
             .await?;
 
+        let total_tracks = playlist.track_total();
         let tracks = self
-            .all_paging_items(
+            .all_paging_items::<TolerantPlaylistItem>(
                 &format!(
                     "{SPOTIFY_API_ENDPOINT}/playlists/{}/items",
                     playlist_id.id(),
                 ),
-                playlist.tracks.total as usize,
+                total_tracks,
                 rate_limit::Priority::Normal,
             )
             .await?
             .into_iter()
-            .filter_map(Track::try_from_playlist_item)
+            .filter_map(TolerantPlaylistItem::into_track)
             .collect::<Vec<_>>();
 
         Ok(Context::Playlist {
@@ -2270,35 +3474,37 @@ impl AppClient {
         let album_uri = album_id.uri();
         tracing::info!("Get album context: {}", album_uri);
 
-        let album = self
-            .http_get_with::<rspotify::model::FullAlbum>(
+        let album_detail = self
+            .http_get_with::<TolerantAlbumDetail>(
                 &format!("{SPOTIFY_API_ENDPOINT}/albums/{}", album_id.id()),
                 &Query::from([("market", "from_token")]),
                 rate_limit::Priority::Normal,
             )
             .await?;
 
-        let total_tracks = album.tracks.total as usize;
+        let total_tracks = album_detail.track_total();
 
-        // converts `rspotify::model::FullAlbum` into `state::Album`
-        let album: Album = album.into();
+        // converts the album payload into `state::Album`
+        let album = album_detail
+            .into_album()
+            .context("album payload has no id")?;
 
         // get the album's tracks
         let tracks = self
-            .all_paging_items(
+            .all_paging_items::<TolerantTrack>(
                 &format!("{SPOTIFY_API_ENDPOINT}/albums/{}/tracks", album_id.id()),
                 total_tracks,
                 rate_limit::Priority::Normal,
             )
             .await?
             .into_iter()
-            .filter_map(|t| {
+            .filter_map(|track| {
                 // simplified track doesn't have album so
                 // we need to manually include one during
                 // converting into `state::Track`
-                Track::try_from_simplified_track(t).map(|mut t| {
-                    t.album = Some(album.clone());
-                    t
+                track.into_track(None).map(|mut track| {
+                    track.album = Some(album.clone());
+                    track
                 })
             })
             .collect::<Vec<_>>();
@@ -2312,49 +3518,71 @@ impl AppClient {
     /// rspotify. Takes the ID by value to mirror rspotify's signature and keep existing call
     /// sites (`artist_id.as_ref()` / `id.clone()`) compiling.
     pub async fn artist(&self, id: ArtistId<'_>) -> Result<rspotify::model::FullArtist> {
-        self.http_get_with(
-            &format!("{SPOTIFY_API_ENDPOINT}/artists/{}", id.id()),
-            &Query::new(),
-            rate_limit::Priority::High,
-        )
-        .await
+        let artist = self
+            .http_get_with::<TolerantFullArtist>(
+                &format!("{SPOTIFY_API_ENDPOINT}/artists/{}", id.id()),
+                &Query::new(),
+                rate_limit::Priority::High,
+            )
+            .await?;
+        Ok(artist.into())
     }
 
-    /// Get an artist context data
+    /// Get an artist context data.
+    ///
+    /// The top tracks, albums and related artists are all best-effort: a reduced app
+    /// registration is refused by `top-tracks` (403) and the `related-artists` endpoint no longer
+    /// exists, and neither may take the page down with it. Each failure is warned about once per
+    /// session.
     pub async fn artist_context(&self, artist_id: ArtistId<'_>) -> Result<Context> {
         let artist_uri = artist_id.uri();
         tracing::info!("Get artist context: {}", artist_uri);
 
         // get the artist's information, including top tracks, related artists, and albums
-
-        let artist = self
+        let artist: Artist = self
             .artist(artist_id.as_ref())
             .await
             .context("get artist")?
             .into();
 
-        let top_tracks = self
+        let top_tracks = match self
             .artist_top_tracks(artist_id.as_ref(), Some(rspotify::model::Market::FromToken))
             .await
-            .context("get artist's top tracks")?
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect::<Vec<_>>();
+        {
+            Ok(tracks) => tracks
+                .into_iter()
+                .filter_map(Track::try_from_full_track)
+                .collect(),
+            Err(err) => {
+                warn_once_unavailable(
+                    &ARTIST_TOP_TRACKS_UNAVAILABLE,
+                    "top tracks",
+                    &anyhow::Error::new(err),
+                );
+                Vec::new()
+            }
+        };
 
         #[allow(deprecated)]
-        let related_artists = self
-            .artist_related_artists(artist_id.as_ref())
-            .await
-            .ok()
-            .unwrap_or_default()
-            .into_iter()
-            .map(std::convert::Into::into)
-            .collect::<Vec<_>>();
+        let related_artists = match self.artist_related_artists(artist_id.as_ref()).await {
+            Ok(artists) => artists.into_iter().map(Into::into).collect(),
+            Err(err) => {
+                warn_once_unavailable(
+                    &ARTIST_RELATED_ARTISTS_UNAVAILABLE,
+                    "related artists",
+                    &anyhow::Error::new(err),
+                );
+                Vec::new()
+            }
+        };
 
-        let albums = self
-            .artist_albums(artist_id.as_ref())
-            .await
-            .context("get artist's albums")?;
+        let albums = match self.artist_albums(artist_id.as_ref()).await {
+            Ok(albums) => albums,
+            Err(err) => {
+                warn_once_unavailable(&ARTIST_ALBUMS_UNAVAILABLE, "albums", &err);
+                Vec::new()
+            }
+        };
 
         Ok(Context::Artist {
             artist,
@@ -2759,7 +3987,7 @@ impl AppClient {
     /// `Ok(None)` when a [`rate_limit::Priority::Background`] request was deferred.
     async fn all_cursor_based_paging_items_optional<T>(
         &self,
-        first_page: rspotify::model::CursorBasedPage<T>,
+        first_page: TolerantCursorPage<T>,
         priority: rate_limit::Priority,
     ) -> Result<Option<Vec<T>>>
     where
@@ -2769,11 +3997,7 @@ impl AppClient {
         let mut maybe_next = first_page.next;
         while let Some(url) = maybe_next {
             let Some(mut next_page) = self
-                .http_get_optional::<rspotify::model::CursorBasedPage<T>>(
-                    &url,
-                    &Query::new(),
-                    priority,
-                )
+                .http_get_optional::<TolerantCursorPage<T>>(&url, &Query::new(), priority)
                 .await?
             else {
                 return Ok(None);
@@ -2789,12 +4013,14 @@ impl AppClient {
     ) -> Result<Option<rspotify::model::CurrentPlaybackContext>> {
         // `GET /me/player` answers `204 No Content` when nothing is playing; `http_get_with`
         // maps that to `None`.
-        self.http_get_with(
-            &format!("{SPOTIFY_API_ENDPOINT}/me/player"),
-            &Query::from([("additional_types", "track,episode")]),
-            rate_limit::Priority::High,
-        )
-        .await
+        let playback = self
+            .http_get_with::<Option<TolerantPlayback>>(
+                &format!("{SPOTIFY_API_ENDPOINT}/me/player"),
+                &Query::from([("additional_types", "track,episode")]),
+                rate_limit::Priority::High,
+            )
+            .await?;
+        Ok(playback.map(TolerantPlayback::into_current_playback))
     }
 
     /// Retrieve the latest playback state
@@ -3171,6 +4397,326 @@ impl AppClient {
     }
 }
 
+/// A playback start prepared for `Spirc::load`, with the pane data to publish until the first
+/// player event arrives.
+#[cfg(feature = "streaming")]
+struct LocalLoad {
+    request: librespot_connect::LoadRequest,
+    /// The item the pane shows until librespot reports the actual track.
+    item_uri: Option<String>,
+    /// The context the load addresses, for the context kinds that carry one.
+    context: Option<(String, rspotify::model::Type)>,
+}
+
+/// Build the librespot load request that starts `playback` on the integrated player.
+///
+/// `None` when there is nothing to load: a `Tracks` context (liked/top/recently played) whose
+/// tracks are not cached locally, or an empty URI list.
+#[cfg(feature = "streaming")]
+fn local_load(state: &SharedState, playback: &Playback, shuffle: bool) -> Option<LocalLoad> {
+    let options = librespot_connect::LoadRequestOptions {
+        start_playing: true,
+        seek_to: 0,
+        context_options: Some(librespot_connect::LoadContextOptions::Options(
+            librespot_connect::Options {
+                shuffle,
+                repeat: false,
+                repeat_track: false,
+            },
+        )),
+        playing_track: None,
+    };
+
+    let (request, item_uri, context) = match playback {
+        // The Web API refuses to start a `Tracks` context (it has no such playback context);
+        // the local player takes the track list from the app's caches instead.
+        Playback::Context(ContextId::Tracks(tracks_id), offset) => {
+            let uris = context_track_uris(state, tracks_id);
+            if uris.is_empty() {
+                return None;
+            }
+            let playing_track = offset_uri(offset.as_ref());
+            let item_uri = playing_track.clone().or_else(|| uris.first().cloned());
+            (
+                librespot_connect::LoadRequest::from_tracks(
+                    uris,
+                    librespot_connect::LoadRequestOptions {
+                        playing_track: playing_track.map(librespot_connect::PlayingTrack::Uri),
+                        ..options
+                    },
+                ),
+                item_uri,
+                None,
+            )
+        }
+        Playback::Context(id, offset) => {
+            let playing_track = offset_uri(offset.as_ref());
+            let item_uri = playing_track
+                .clone()
+                .or_else(|| first_context_item_uri(state, id));
+            (
+                librespot_connect::LoadRequest::from_context_uri(
+                    id.uri(),
+                    librespot_connect::LoadRequestOptions {
+                        playing_track: playing_track.map(librespot_connect::PlayingTrack::Uri),
+                        ..options
+                    },
+                ),
+                item_uri,
+                Some((id.uri(), context_type(id))),
+            )
+        }
+        Playback::URIs(ids, offset) => {
+            let uris: Vec<String> = ids.iter().map(rspotify::prelude::Id::uri).collect();
+            if uris.is_empty() {
+                return None;
+            }
+            let playing_track = offset_uri(offset.as_ref());
+            let item_uri = playing_track.clone().or_else(|| uris.first().cloned());
+            (
+                librespot_connect::LoadRequest::from_tracks(
+                    uris,
+                    librespot_connect::LoadRequestOptions {
+                        playing_track: playing_track.map(librespot_connect::PlayingTrack::Uri),
+                        ..options
+                    },
+                ),
+                item_uri,
+                None,
+            )
+        }
+    };
+
+    Some(LocalLoad {
+        request,
+        item_uri,
+        context,
+    })
+}
+
+/// Convert an app volume percentage (0-100) into librespot's 0-65535 range.
+#[cfg(feature = "streaming")]
+fn volume_to_librespot(volume_percent: u8) -> u16 {
+    (f64::from(volume_percent) / 100.0 * 65_535.0).round() as u16
+}
+
+/// URI carried by a playback [`rspotify::model::Offset`], when it addresses an item by URI.
+#[cfg(feature = "streaming")]
+fn offset_uri(offset: Option<&rspotify::model::Offset>) -> Option<String> {
+    match offset {
+        Some(rspotify::model::Offset::Uri(uri)) => Some(uri.clone()),
+        _ => None,
+    }
+}
+
+/// The Web API context `Type` for a context id.
+#[cfg(feature = "streaming")]
+fn context_type(id: &ContextId) -> rspotify::model::Type {
+    match id {
+        ContextId::Playlist(_) => rspotify::model::Type::Playlist,
+        ContextId::Album(_) => rspotify::model::Type::Album,
+        ContextId::Artist(_) => rspotify::model::Type::Artist,
+        ContextId::Show(_) => rspotify::model::Type::Show,
+        ContextId::Tracks(_) => rspotify::model::Type::Collection,
+    }
+}
+
+/// URI of the first playable item of a context, from the in-memory context cache. Used to fill
+/// the playback pane when `StartPlayback` carries no explicit offset.
+#[cfg(feature = "streaming")]
+fn first_context_item_uri(state: &SharedState, id: &ContextId) -> Option<String> {
+    let uri = id.uri();
+    let data = state.data.read();
+    match data.caches.context.get(&uri)? {
+        Context::Playlist { tracks, .. } | Context::Album { tracks, .. } => {
+            tracks.first().map(|t| t.id.uri())
+        }
+        Context::Artist { top_tracks, .. } => top_tracks.first().map(|t| t.id.uri()),
+        Context::Tracks { tracks, .. } => tracks.first().map(|t| t.id.uri()),
+        Context::Show { episodes, .. } => episodes.first().map(|e| e.id.uri()),
+    }
+}
+
+/// Track URIs of a `Tracks` context (liked/top/recently played). The Web API path cannot start
+/// these contexts, so the local player takes the track list directly.
+#[cfg(feature = "streaming")]
+fn context_track_uris(state: &SharedState, tracks_id: &TracksId) -> Vec<String> {
+    if let Some(Context::Tracks { tracks, .. }) =
+        state.data.read().caches.context.get(&tracks_id.uri)
+    {
+        return tracks.iter().map(|t| t.id.uri()).collect();
+    }
+    if tracks_id.uri == USER_LIKED_TRACKS_URI {
+        // The liked list may not have been fetched into the context cache yet; the disk-seeded
+        // library is the same source the page renders from.
+        let mut uris: Vec<String> = state
+            .data
+            .read()
+            .user_data
+            .saved_tracks
+            .values()
+            .map(|t| t.id.uri())
+            .collect();
+        uris.sort();
+        return uris;
+    }
+    Vec::new()
+}
+
+/// Resolve a playable item from the app's caches so the playback pane can show real metadata
+/// while the Web API cannot refresh `/me/player`.
+#[cfg(feature = "streaming")]
+fn playback_item_for_uri(state: &SharedState, uri: &str) -> Option<rspotify::model::PlayableItem> {
+    if let Some(track) = state.data.read().user_data.saved_tracks.get(uri) {
+        return Some(app_track_to_playable(track));
+    }
+
+    // `TtlCache::iter` needs `&mut`, so this scan takes a write guard (no await while held).
+    let mut data = state.data.write();
+    for (_, context) in data.caches.context.iter() {
+        match context {
+            Context::Playlist { tracks, .. } | Context::Album { tracks, .. } => {
+                if let Some(track) = tracks.iter().find(|t| t.id.uri() == uri) {
+                    return Some(app_track_to_playable(track));
+                }
+            }
+            Context::Artist { top_tracks, .. } => {
+                if let Some(track) = top_tracks.iter().find(|t| t.id.uri() == uri) {
+                    return Some(app_track_to_playable(track));
+                }
+            }
+            Context::Tracks { tracks, .. } => {
+                if let Some(track) = tracks.iter().find(|t| t.id.uri() == uri) {
+                    return Some(app_track_to_playable(track));
+                }
+            }
+            Context::Show { episodes, .. } => {
+                if let Some(episode) = episodes.iter().find(|e| e.id.uri() == uri) {
+                    return app_episode_to_playable(episode);
+                }
+            }
+        }
+    }
+    None
+}
+fn app_artist_to_simplified(artist: &Artist) -> rspotify::model::SimplifiedArtist {
+    rspotify::model::SimplifiedArtist {
+        external_urls: HashMap::new(),
+        href: None,
+        id: Some(artist.id.clone()),
+        name: artist.name.clone(),
+    }
+}
+
+fn app_album_to_simplified(album: &Album) -> rspotify::model::SimplifiedAlbum {
+    rspotify::model::SimplifiedAlbum {
+        album_group: None,
+        album_type: album
+            .typ
+            .and_then(|typ| serde_json::to_value(typ).ok())
+            .and_then(|value| value.as_str().map(str::to_owned)),
+        artists: album.artists.iter().map(app_artist_to_simplified).collect(),
+        available_markets: Vec::new(),
+        external_urls: HashMap::new(),
+        href: None,
+        id: Some(album.id.clone()),
+        // The app's cached album has no cover images, so the pane shows no cover for a locally
+        // resolved item (the Web API refresh, when available, replaces this with the real one).
+        images: Vec::new(),
+        name: album.name.clone(),
+        release_date: Some(album.release_date.clone()),
+        release_date_precision: None,
+        restrictions: None,
+    }
+}
+
+fn app_track_to_playable(track: &Track) -> rspotify::model::PlayableItem {
+    let album = track.album.as_ref().map_or_else(
+        || rspotify::model::SimplifiedAlbum {
+            album_group: None,
+            album_type: None,
+            artists: Vec::new(),
+            available_markets: Vec::new(),
+            external_urls: HashMap::new(),
+            href: None,
+            id: None,
+            images: Vec::new(),
+            name: String::new(),
+            release_date: None,
+            release_date_precision: None,
+            restrictions: None,
+        },
+        app_album_to_simplified,
+    );
+
+    rspotify::model::PlayableItem::Track(rspotify::model::FullTrack {
+        album,
+        artists: track.artists.iter().map(app_artist_to_simplified).collect(),
+        available_markets: Vec::new(),
+        disc_number: 1,
+        duration: chrono::Duration::from_std(track.duration).unwrap_or_default(),
+        explicit: track.explicit,
+        external_ids: HashMap::new(),
+        external_urls: HashMap::new(),
+        href: None,
+        id: Some(track.id.clone()),
+        is_local: false,
+        is_playable: None,
+        linked_from: None,
+        restrictions: None,
+        name: track.name.clone(),
+        popularity: 0,
+        preview_url: None,
+        track_number: 0,
+        r#type: rspotify::model::Type::Track,
+    })
+}
+
+/// Convert a cached episode into a playable item. `None` when the episode has no associated
+/// show, since `FullEpisode` requires one.
+#[allow(deprecated)] // `FullEpisode::language` is deprecated but still required by the struct.
+fn app_episode_to_playable(episode: &Episode) -> Option<rspotify::model::PlayableItem> {
+    let show = episode.show.as_ref()?;
+    let show = rspotify::model::SimplifiedShow {
+        available_markets: Vec::new(),
+        copyrights: Vec::new(),
+        description: String::new(),
+        explicit: false,
+        external_urls: HashMap::new(),
+        href: String::new(),
+        id: show.id.clone(),
+        images: Vec::new(),
+        is_externally_hosted: None,
+        languages: Vec::new(),
+        media_type: String::new(),
+        name: show.name.clone(),
+        publisher: show.publisher.clone(),
+    };
+
+    Some(rspotify::model::PlayableItem::Episode(
+        rspotify::model::FullEpisode {
+            audio_preview_url: None,
+            description: episode.description.clone(),
+            duration: chrono::Duration::from_std(episode.duration).unwrap_or_default(),
+            explicit: false,
+            external_urls: HashMap::new(),
+            href: String::new(),
+            id: episode.id.clone(),
+            images: Vec::new(),
+            is_externally_hosted: false,
+            is_playable: true,
+            language: String::new(),
+            languages: Vec::new(),
+            name: episode.name.clone(),
+            release_date: episode.release_date.clone(),
+            release_date_precision: rspotify::model::DatePrecision::Year,
+            resume_point: None,
+            show,
+            r#type: rspotify::model::Type::Episode,
+        },
+    ))
+}
+
 fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
     tracks.retain(|track| track.id != seed_track.id);
     tracks.insert(0, seed_track);
@@ -3179,8 +4725,19 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 #[cfg(test)]
 mod tests {
     use super::move_seed_track_to_front;
-    use crate::state::Track;
+    #[cfg(feature = "streaming")]
+    use super::{is_transient_api_failure, transport_for, PlayerRequest, Transport};
+    use super::{
+        TolerantAlbumDetail, TolerantFullArtist, TolerantPlayback, TolerantPlaylistDetail,
+        TolerantPlaylistItem, TolerantQueue, TolerantSimplifiedPlaylist,
+    };
+    #[cfg(feature = "streaming")]
+    use crate::state::{ContextId, Playback};
+    use crate::state::{Playlist, Track};
+    #[cfg(feature = "streaming")]
+    use rspotify::model::PlaylistId;
     use rspotify::model::TrackId;
+    use rspotify::prelude::Id;
 
     fn sample_track(id: &'static str, name: &str) -> Track {
         Track {
@@ -3219,5 +4776,359 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].id, seed.id);
         assert_eq!(tracks[1].id, second.id);
+    }
+
+    #[test]
+    fn reduced_playlist_detail_reads_its_total_from_items() {
+        // The reduced shape moves the track page from `tracks` to `items`.
+        let json = r#"{
+            "id": "4CUQQ1fJ2FCuiXRidjssjl",
+            "name": "Reduced playlist",
+            "collaborative": false,
+            "description": "A &amp; B <b>bold</b>",
+            "snapshot_id": "snap",
+            "owner": {"id": "owner", "display_name": "Owner"},
+            "items": {"href": "x", "total": 2, "items": []}
+        }"#;
+
+        let detail: TolerantPlaylistDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.track_total(), 2);
+
+        let playlist = Playlist::from(detail);
+        assert_eq!(playlist.name, "Reduced playlist");
+        assert_eq!(playlist.owner.0, "Owner");
+        assert_eq!(playlist.owner.1.id(), "owner");
+        assert_eq!(playlist.snapshot_id, "snap");
+        // the description is stripped and unescaped like rspotify's conversion does
+        assert_eq!(playlist.desc, "A & B bold");
+
+        // the classic shape keeps working through `tracks`
+        let classic = json.replace(
+            "\"items\": {\"href\": \"x\", \"total\": 2, \"items\": []}",
+            "\"tracks\": {\"total\": 3, \"items\": []}",
+        );
+        let detail: TolerantPlaylistDetail = serde_json::from_str(&classic).unwrap();
+        assert_eq!(detail.track_total(), 3);
+    }
+
+    #[test]
+    fn playlist_entries_convert_from_item_and_track() {
+        // The reduced shape names the entry's playable `item`; the classic shape names it `track`.
+        let reduced = r#"{
+            "added_at": "2024-06-01T12:00:00Z",
+            "item": {
+                "type": "track",
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Reduced entry",
+                "duration_ms": 60000,
+                "explicit": false,
+                "artists": [{"id": "2CaSnl81O3ZQGOy25LqoR7", "name": "Artist"}]
+            }
+        }"#;
+        let classic = r#"{
+            "track": {
+                "type": "track",
+                "id": "1301WleyT98MSxVHPZCA6M",
+                "name": "Classic entry",
+                "duration_ms": 1000,
+                "explicit": true,
+                "artists": []
+            }
+        }"#;
+        // an episode in a playlist is not a track, as before
+        let episode = r#"{"item": {"type": "episode", "in_playlist": true}}"#;
+
+        let entry: TolerantPlaylistItem = serde_json::from_str(reduced).unwrap();
+        let track = entry.into_track().expect("reduced entry converts");
+        assert_eq!(track.name, "Reduced entry");
+        assert_eq!(track.duration.as_secs(), 60);
+        assert_eq!(track.added_at, 1_717_243_200);
+
+        let entry: TolerantPlaylistItem = serde_json::from_str(classic).unwrap();
+        let track = entry.into_track().expect("classic entry converts");
+        assert_eq!(track.name, "Classic entry");
+        assert!(track.explicit);
+
+        let entry: TolerantPlaylistItem = serde_json::from_str(episode).unwrap();
+        assert!(entry.into_track().is_none());
+    }
+
+    #[test]
+    fn reduced_playback_item_is_a_real_track() {
+        let json = r#"{
+            "device": {"id": "dev", "is_active": true, "is_private_session": false,
+                       "is_restricted": false, "name": "device", "type": "Computer",
+                       "volume_percent": 42},
+            "repeat_state": "off",
+            "shuffle_state": true,
+            "context": {"uri": "spotify:playlist:4CUQQ1fJ2FCuiXRidjssjl", "type": "playlist"},
+            "timestamp": 1717243200000,
+            "progress_ms": 5000,
+            "is_playing": true,
+            "currently_playing_type": "track",
+            "item": {
+                "type": "track",
+                "id": "4uLU6hMCjMI75M1A2tKUQC",
+                "name": "Reduced Track",
+                "duration_ms": 200000,
+                "explicit": false,
+                "artists": [{"id": "2CaSnl81O3ZQGOy25LqoR7", "name": "Artist"}],
+                "album": {"id": "1301WleyT98MSxVHPZCA6M", "name": "Album",
+                          "release_date": "2020-01-01", "album_type": "album"}
+            }
+        }"#;
+
+        // the reduced `item` withholds `popularity`/`external_ids`, which is what used to make
+        // the whole response unparseable and the pane fall back to `Unknown`
+        assert!(serde_json::from_str::<rspotify::model::CurrentPlaybackContext>(json).is_err());
+
+        let playback: TolerantPlayback = serde_json::from_str(json).unwrap();
+        let playback = playback.into_current_playback();
+
+        let rspotify::model::PlayableItem::Track(track) =
+            playback.item.expect("the payload has an item")
+        else {
+            panic!("the reduced item must convert into a real track");
+        };
+        assert_eq!(track.name, "Reduced Track");
+        assert_eq!(track.album.name, "Album");
+        assert_eq!(
+            playback.currently_playing_type,
+            rspotify::model::CurrentlyPlayingType::Track
+        );
+        assert_eq!(
+            playback.progress,
+            Some(chrono::Duration::milliseconds(5000))
+        );
+        assert_eq!(playback.timestamp.timestamp_millis(), 1_717_243_200_000);
+        assert_eq!(playback.device.id.as_deref(), Some("dev"));
+        assert_eq!(
+            playback
+                .context
+                .as_ref()
+                .map(|context| context.uri.as_str()),
+            Some("spotify:playlist:4CUQQ1fJ2FCuiXRidjssjl")
+        );
+        assert!(playback.is_playing);
+        assert!(playback.shuffle_state);
+    }
+
+    #[test]
+    fn reduced_artist_parses_without_followers_genres_or_popularity() {
+        let json = r#"{
+            "external_urls": {"spotify": "https://open.spotify.com/artist/2CaSnl81O3ZQGOy25LqoR7"},
+            "href": "https://api.spotify.com/v1/artists/2CaSnl81O3ZQGOy25LqoR7",
+            "id": "2CaSnl81O3ZQGOy25LqoR7",
+            "images": [{"url": "https://i.scdn.co/image/x", "height": 640, "width": 640}],
+            "name": "Laura Canela",
+            "type": "artist",
+            "uri": "spotify:artist:2CaSnl81O3ZQGOy25LqoR7"
+        }"#;
+
+        assert!(serde_json::from_str::<rspotify::model::FullArtist>(json).is_err());
+
+        let artist: TolerantFullArtist = serde_json::from_str(json).unwrap();
+        let artist: rspotify::model::FullArtist = artist.into();
+        assert_eq!(artist.name, "Laura Canela");
+        assert_eq!(artist.id.id(), "2CaSnl81O3ZQGOy25LqoR7");
+        // fields the reduced shape withholds (and the app never displays) are filled in
+        assert!(artist.genres.is_empty());
+        assert_eq!(artist.popularity, 0);
+        assert_eq!(artist.followers.total, 0);
+
+        // fields that are present keep their values
+        let full = r#"{"id": "2CaSnl81O3ZQGOy25LqoR7", "name": "Full", "genres": ["pop"],
+                       "popularity": 66, "followers": {"total": 5}}"#;
+        let artist: TolerantFullArtist = serde_json::from_str(full).unwrap();
+        let artist: rspotify::model::FullArtist = artist.into();
+        assert_eq!(artist.genres, ["pop"]);
+        assert_eq!(artist.popularity, 66);
+        assert_eq!(artist.followers.total, 5);
+    }
+
+    #[test]
+    fn reduced_playlist_entry_without_tracks_parses() {
+        let json = r#"{
+            "id": "4CUQQ1fJ2FCuiXRidjssjl",
+            "name": "Reduced playlist",
+            "collaborative": false,
+            "snapshot_id": "snap",
+            "owner": {"id": "owner", "display_name": "Owner"},
+            "items": {"href": "x", "total": 2, "items": []}
+        }"#;
+
+        assert!(serde_json::from_str::<rspotify::model::SimplifiedPlaylist>(json).is_err());
+
+        let playlist: TolerantSimplifiedPlaylist = serde_json::from_str(json).unwrap();
+        let playlist = Playlist::from(playlist);
+        assert_eq!(playlist.name, "Reduced playlist");
+        assert_eq!(playlist.owner.1.id(), "owner");
+        assert_eq!(playlist.snapshot_id, "snap");
+        // the library list carries no description; the playlist detail fetch fills it in
+        assert!(playlist.desc.is_empty());
+    }
+
+    #[test]
+    fn reduced_album_detail_parses_without_popularity_or_label() {
+        let json = r#"{
+            "id": "1301WleyT98MSxVHPZCA6M",
+            "name": "Reduced Album",
+            "album_type": "single",
+            "release_date": "2021-05-05",
+            "total_tracks": 2,
+            "artists": [{"id": "2CaSnl81O3ZQGOy25LqoR7", "name": "Artist"}],
+            "tracks": {"total": 2, "items": []}
+        }"#;
+
+        assert!(serde_json::from_str::<rspotify::model::FullAlbum>(json).is_err());
+
+        let detail: TolerantAlbumDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.track_total(), 2);
+
+        let album = detail.into_album().expect("the payload has an id");
+        assert_eq!(album.name, "Reduced Album");
+        assert_eq!(album.release_date, "2021-05-05");
+        assert_eq!(album.typ, Some(rspotify::model::AlbumType::Single));
+        assert_eq!(album.artists[0].name, "Artist");
+    }
+
+    #[test]
+    fn queue_keeps_unparseable_entries_as_unknown() {
+        let json = r#"{
+            "currently_playing": {
+                "type": "track", "id": "4uLU6hMCjMI75M1A2tKUQC", "name": "Playing",
+                "duration_ms": 1000, "explicit": false, "artists": []
+            },
+            "queue": [
+                {"type": "track", "id": "1301WleyT98MSxVHPZCA6M", "name": "Next",
+                 "duration_ms": 1000, "explicit": false, "artists": []},
+                {"id": "local-file", "is_local": true, "name": "Local"}
+            ]
+        }"#;
+
+        let queue: TolerantQueue = serde_json::from_str(json).unwrap();
+        let queue = queue.into_current_user_queue();
+
+        assert!(matches!(
+            queue.currently_playing,
+            Some(rspotify::model::PlayableItem::Track(_))
+        ));
+        assert_eq!(queue.queue.len(), 2);
+        assert!(matches!(
+            queue.queue[0],
+            rspotify::model::PlayableItem::Track(_)
+        ));
+        // like rspotify, an entry that is neither track nor episode is kept as raw `Unknown`
+        assert!(matches!(
+            queue.queue[1],
+            rspotify::model::PlayableItem::Unknown(_)
+        ));
+    }
+
+    /// One request per transport-relevant kind, as the local transport sees them.
+    #[cfg(feature = "streaming")]
+    fn player_requests() -> Vec<(PlayerRequest, &'static str)> {
+        let playback = Playback::URIs(
+            vec![rspotify::model::PlayableId::Track(
+                TrackId::from_id("4uLU6hMCjMI75M1A2tKUQC")
+                    .unwrap()
+                    .into_static(),
+            )],
+            None,
+        );
+        vec![
+            (PlayerRequest::StartPlayback(playback, Some(true)), "start"),
+            (PlayerRequest::Pause, "pause"),
+            (PlayerRequest::Resume, "resume"),
+            (PlayerRequest::ResumePause, "resume/pause"),
+            (PlayerRequest::NextTrack, "next"),
+            (PlayerRequest::PreviousTrack, "previous"),
+            (
+                PlayerRequest::SeekTrack(chrono::Duration::seconds(30)),
+                "seek",
+            ),
+            (PlayerRequest::Repeat, "repeat"),
+            (PlayerRequest::Shuffle, "shuffle"),
+            (PlayerRequest::Volume(50), "volume"),
+            (PlayerRequest::ToggleMute, "mute"),
+            (
+                PlayerRequest::TransferPlayback("device".to_string(), true),
+                "transfer",
+            ),
+        ]
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn integrated_active_device_serves_every_request_locally() {
+        for (request, what) in player_requests() {
+            // our own device is active: the request never reaches the Web API ...
+            assert_eq!(
+                transport_for(&request, true, false),
+                Transport::Integrated,
+                "{what} must run on the integrated player"
+            );
+            // ... and a failed Web API attempt cannot change that, since none is made
+            assert_eq!(
+                transport_for(&request, true, true),
+                Transport::Integrated,
+                "{what} must not be retried on the Web API"
+            );
+        }
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn other_active_device_keeps_the_web_api() {
+        for (request, what) in player_requests() {
+            if matches!(request, PlayerRequest::StartPlayback(..)) {
+                continue; // covered by the fallback test
+            }
+            assert_eq!(
+                transport_for(&request, false, false),
+                Transport::WebApi,
+                "{what} must stay on the Web API"
+            );
+            assert_eq!(
+                transport_for(&request, false, true),
+                Transport::WebApi,
+                "{what} must not fall back to the local player"
+            );
+        }
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn playback_start_falls_back_to_local_only_after_a_failed_api_call() {
+        let start = PlayerRequest::StartPlayback(
+            Playback::Context(
+                ContextId::Playlist(
+                    PlaylistId::from_id("4CUQQ1fJ2FCuiXRidjssjl")
+                        .unwrap()
+                        .into_static(),
+                ),
+                None,
+            ),
+            None,
+        );
+
+        // another device is active: the Web API is asked first ...
+        assert_eq!(transport_for(&start, false, false), Transport::WebApi);
+        // ... and only its failure lets the local player claim the device
+        assert_eq!(
+            transport_for(&start, false, true),
+            Transport::WebApiWithLocalFallback
+        );
+    }
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn rate_limit_and_connectivity_failures_are_transient() {
+        assert!(is_transient_api_failure(&anyhow::anyhow!(
+            "rate-limited (429) requesting https://api.spotify.com/v1/me/player"
+        )));
+        assert!(!is_transient_api_failure(&anyhow::anyhow!(
+            "failed to send a Spotify API request https://api.spotify.com/v1/me/player: Forbidden"
+        )));
     }
 }
