@@ -128,7 +128,7 @@ fn handle_page_change_event(
     client_pub: &flume::Sender<ClientRequest>,
     handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
-    match state.ui.lock().current_page_mut() {
+    match state.view.lock().current_page_mut() {
         PageState::Context {
             id,
             context_page_type,

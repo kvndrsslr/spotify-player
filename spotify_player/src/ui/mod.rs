@@ -1,11 +1,16 @@
 use crate::{
     config,
     state::{
-        Album, Artist, ArtistFocusState, BrowsePageUIState, Context, ContextPageUIState,
+        Album, Artist, ArtistFocusState, BrowsePageUIState, Context, ContextPageUIState, Cursor,
         DataReadGuard, Id, LibraryFocusState, MutableWindowState, PageState, PageType,
         PlaybackMetadata, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistPopupAction,
-        PopupState, SearchFocusState, SharedState, ShowFocusState, Track, UIStateGuard,
+        PopupState, SearchFocusState, SharedState, ShowFocusState, Track,
     },
+};
+
+pub use self::{
+    ctx::Ctx,
+    state::{ProgressBarLayout, SharedUiState, UIState},
 };
 use anyhow::{Context as AnyhowContext, Result};
 use ratatui::{
@@ -21,25 +26,29 @@ use ratatui::{
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
+mod ctx;
 #[cfg(feature = "image")]
 pub mod image_compositor;
 mod page;
 mod playback;
 mod popup;
 pub mod single_line_input;
+mod state;
 #[cfg(feature = "streaming")]
 pub mod streaming;
 pub mod utils;
 
 /// Run the application UI
-pub fn run(state: &SharedState, mut terminal: Terminal) -> Result<()> {
+pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal) -> Result<()> {
     let ui_refresh_duration = std::time::Duration::from_millis(
         config::get_config().app_config.app_refresh_duration_in_ms,
     );
 
     loop {
         {
-            let mut ui = state.ui.lock();
+            let mut tui = ui_state.lock();
+            let mut ui = Ctx::new(state.view.lock(), &mut tui);
+
             if !ui.is_running {
                 clean_up(terminal).context("clean up UI resources")?;
                 std::process::exit(0);
@@ -47,12 +56,12 @@ pub fn run(state: &SharedState, mut terminal: Terminal) -> Result<()> {
 
             #[cfg(feature = "image")]
             // Frame-skip detection: surfaces idle for a pass are healed on their next render.
-            ui.image_compositor.begin_frame();
+            ui.tui.image_compositor.begin_frame();
 
             if let Err(err) = terminal.draw(|frame| {
                 // set the background and foreground colors for the application
                 let rect = frame.area();
-                let block = Block::default().style(ui.theme.app());
+                let block = Block::default().style(ui.tui.theme.app());
                 frame.render_widget(block, rect);
 
                 render_application(frame, state, &mut ui, rect);
@@ -80,8 +89,8 @@ pub fn init_terminal() -> Result<Terminal> {
 }
 
 #[cfg(feature = "image")]
-pub fn init_image_picker(state: &SharedState) -> Result<()> {
-    let mut ui = state.ui.lock();
+pub fn init_image_picker(ui_state: &SharedUiState) -> Result<()> {
+    let mut ui = ui_state.lock();
     crossterm::terminal::enable_raw_mode()?;
 
     // `Picker::from_query_stdio` reads the terminal's answer on a detached thread. Inside a
@@ -155,7 +164,7 @@ fn clean_up(mut terminal: Terminal) -> Result<()> {
 }
 
 /// Render the application
-fn render_application(frame: &mut Frame, state: &SharedState, ui: &mut UIStateGuard, rect: Rect) {
+fn render_application(frame: &mut Frame, state: &SharedState, ui: &mut Ctx<'_>, rect: Rect) {
     // rendering order: playback window -> shortcut help popup -> other popups -> main layout
 
     // render playback window before other popups and windows to ensure nothing is rendered on top
@@ -175,7 +184,7 @@ fn render_main_layout(
     is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) {
     let page_type = ui.current_page().page_type();

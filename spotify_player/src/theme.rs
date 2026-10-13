@@ -145,7 +145,7 @@ impl ThemeConfig {
     /// parses configurations from a theme config file in `path` folder,
     /// then updates the current configurations accordingly.
     fn parse_config_file(&mut self, path: &std::path::Path) -> Result<()> {
-        let file_path = path.join(super::THEME_CONFIG_FILE);
+        let file_path = path.join(crate::config::THEME_CONFIG_FILE);
         match std::fs::read_to_string(&file_path) {
             Err(err) => {
                 tracing::warn!(

@@ -1,0 +1,98 @@
+[package]
+name = "spotify_player_core"
+version = "0.24.1"
+authors = ["Thang Pham <phamducthang1234@gmail.com>"]
+edition = "2021"
+license = "MIT"
+description = "Framework-agnostic core of spotify-player: data model, state, playback, client and command execution"
+repository = "https://github.com/aome510/spotify-player"
+keywords = ["spotify", "player", "librespot", "core"]
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.91"
+base64 = "0.22.1"
+chrono = "0.4.45"
+config_parser2 = "0.1.7"
+dirs-next = "2.0.0"
+flume = "0.12.0"
+futures = "0.3.33"
+html-escape = "0.2.14"
+librespot-connect = { version = "0.8.0", optional = true }
+librespot-core = "0.8.0"
+librespot-metadata = "0.8.0"
+librespot-playback = {version = "0.8.0", optional = true, default-features = false, features = ["native-tls"]}
+log = "0.4.33"
+maybe-async = "0.2.11"
+open = "5.4.0"
+parking_lot = "0.12.5"
+rand = "0.10.2"
+regex = "1.13.1"
+reqwest = { version = "0.13.4", features = ["json", "query", "form", "blocking"] }
+rspotify = {version = "0.15.3", features = ["cli"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.0", features = [
+	"rt",
+	"rt-multi-thread",
+	"macros",
+	"time",
+] }
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ttl_cache = "0.5.1"
+unicode-bidi = "0.3.18"
+which = "8.0.5"
+souvlaki = { version = "0.8.3", optional = true }
+image = { version = "0.25.10", optional = true }
+notify-rust = { version = "4.18.0", optional = true, default-features = false, features = [
+	"d",
+] }
+rustfft = { version = "6", optional = true }
+fuzzy-matcher = { version = "0.3.7", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+clipboard-win = "5.4.1"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.58.0"
+features = [
+	"Win32_Foundation",
+	"Win32_Graphics_Gdi",
+	"Win32_System_LibraryLoader",
+	"Win32_UI_WindowsAndMessaging",
+]
+optional = true
+
+[dev-dependencies]
+# `test-util` provides the paused clock used by the `rate_limit` unit tests. Kept out of the
+# main dependency set so release builds and the lockfile are unchanged.
+tokio = { version = "1.53.0", features = ["test-util"] }
+
+[features]
+alsa-backend = ["streaming", "librespot-playback/alsa-backend"]
+pulseaudio-backend = ["streaming", "librespot-playback/pulseaudio-backend"]
+rodio-backend = ["streaming", "librespot-playback/rodio-backend"]
+portaudio-backend = ["streaming", "librespot-playback/portaudio-backend"]
+jackaudio-backend = ["streaming", "librespot-playback/jackaudio-backend"]
+rodiojack-backend = ["streaming", "librespot-playback/rodiojack-backend"]
+sdl-backend = ["streaming", "librespot-playback/sdl-backend"]
+gstreamer-backend = ["streaming", "librespot-playback/gstreamer-backend"]
+streaming = ["dep:librespot-playback", "dep:librespot-connect", "dep:rustfft"]
+media-control = ["dep:souvlaki", "dep:windows"]
+image = ["dep:image"]
+sixel = ["image"]
+pixelate = ["image"]
+notify = ["dep:notify-rust"]
+fzf = ["dep:fuzzy-matcher"]
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# `async-trait` is pulled in by `maybe_async`'s expansion
+# (`#[async_trait::async_trait]` on the trait impls in `client/spotify.rs`), so it is a real
+# dependency that cargo-machete cannot see.
+ignored = ["async-trait"]

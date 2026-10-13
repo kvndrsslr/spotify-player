@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 /// formats a time duration into a "{minutes}:{seconds}" format
+#[must_use]
 pub fn format_duration(duration: &chrono::Duration) -> String {
     let secs = duration.num_seconds();
     format!("{}:{:02}", secs / 60, secs % 60)
@@ -20,6 +21,7 @@ where
 }
 
 #[allow(dead_code)]
+#[must_use]
 pub fn get_track_album_image_url(track: &rspotify::model::FullTrack) -> Option<&str> {
     if track.album.images.is_empty() {
         None
@@ -29,6 +31,7 @@ pub fn get_track_album_image_url(track: &rspotify::model::FullTrack) -> Option<&
 }
 
 #[allow(dead_code)]
+#[must_use]
 pub fn get_episode_show_image_url(episode: &rspotify::model::FullEpisode) -> Option<&str> {
     if episode.show.images.is_empty() {
         None
@@ -37,6 +40,7 @@ pub fn get_episode_show_image_url(episode: &rspotify::model::FullEpisode) -> Opt
     }
 }
 
+#[must_use]
 pub fn parse_uri(uri: &str) -> Cow<'_, str> {
     let parts = uri.split(':').collect::<Vec<_>>();
     // The below URI probably has a format of `spotify:user:{user_id}:{type}:{id}`,
@@ -94,4 +98,20 @@ pub fn filtered_items_from_query<'a, T: std::fmt::Display>(
             }
         })
         .collect::<Vec<_>>()
+}
+
+/// Convert a string to a bidirectional string.
+///
+/// Used to handle RTL text properly in the UI.
+#[must_use]
+pub fn to_bidi_string(s: &str) -> String {
+    let bidi_info = unicode_bidi::BidiInfo::new(s, None);
+
+    if bidi_info.has_rtl() && !bidi_info.paragraphs.is_empty() {
+        bidi_info
+            .reorder_line(&bidi_info.paragraphs[0], 0..s.len())
+            .into_owned()
+    } else {
+        s.to_string()
+    }
 }

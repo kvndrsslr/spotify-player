@@ -3,7 +3,7 @@ mod data;
 mod model;
 mod player;
 mod queue;
-mod ui;
+mod view;
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -13,7 +13,7 @@ pub use model::*;
 pub use player::*;
 #[allow(unused_imports)]
 pub use queue::*;
-pub use ui::*;
+pub use view::*;
 
 use crate::config;
 
@@ -24,9 +24,24 @@ pub type SharedState = Arc<State>;
 
 /// Application's state
 pub struct State {
-    pub ui: Mutex<UIState>,
+    pub view: Mutex<ViewState>,
     pub player: RwLock<PlayerState>,
     pub data: RwLock<AppData>,
+
+    /// The last locally commanded volume target. Volume events compute against this instead
+    /// of the racy shared `buffered_playback`, so rapid events (scroll wheel) can't step on
+    /// each other; the client task clears it once the change is applied.
+    pub volume_target: Mutex<Option<u8>>,
+
+    /// Image urls awaiting a background fetch, with retry attempt counts. Render paths enqueue
+    /// cache misses here plus the moving prefetch window around the selected episode; the
+    /// client task drains them.
+    #[cfg(feature = "image")]
+    pub image_fetch_queue: Mutex<Vec<(String, u8)>>,
+    /// Endpoints of the last enqueued episode-image window, used to detect selection moves
+    /// without re-enqueueing every frame.
+    #[cfg(feature = "image")]
+    pub image_window_signature: Mutex<Option<(String, String)>>,
 
     pub is_daemon: bool,
 
@@ -34,32 +49,30 @@ pub struct State {
     /// `Some` only when `enable_audio_visualization` is `true`; avoids allocating
     /// the mutex/state entirely when the feature is not in use.
     #[cfg(feature = "streaming")]
-    pub vis_bands: Option<Arc<Mutex<crate::ui::streaming::VisBands>>>,
+    pub vis_bands: Option<Arc<Mutex<crate::visualization::VisBands>>>,
 
     pub logs: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl State {
     pub fn new(is_daemon: bool, log_buffer: Arc<Mutex<VecDeque<String>>>) -> Self {
-        let mut ui = UIState::default();
         let configs = config::get_config();
-
-        if let Some(theme) = configs.theme_config.find_theme(&configs.app_config.theme) {
-            // update the UI's theme based on the `theme` config option
-            ui.theme = theme;
-        }
-
         let app_data = AppData::new(&configs.cache_folder);
 
         Self {
-            ui: Mutex::new(ui),
+            view: Mutex::new(ViewState::default()),
             player: RwLock::new(PlayerState::default()),
+            volume_target: Mutex::new(None),
+            #[cfg(feature = "image")]
+            image_fetch_queue: Mutex::new(Vec::new()),
+            #[cfg(feature = "image")]
+            image_window_signature: Mutex::new(None),
             data: RwLock::new(app_data),
             is_daemon,
             #[cfg(feature = "streaming")]
             vis_bands: if configs.app_config.enable_audio_visualization {
                 Some(Arc::new(Mutex::new(
-                    crate::ui::streaming::VisBands::default(),
+                    crate::visualization::VisBands::default(),
                 )))
             } else {
                 None
@@ -67,6 +80,31 @@ impl State {
 
             logs: log_buffer,
         }
+    }
+
+    /// Queue an image url for background fetching; retried url bumps its attempt count.
+    #[cfg(feature = "image")]
+    pub fn queue_image_fetch(&self, url: &str) {
+        const MAX_PENDING: usize = 32;
+        let mut queue = self.image_fetch_queue.lock();
+        if let Some(entry) = queue.iter_mut().find(|(u, _)| u == url) {
+            entry.1 = entry.1.saturating_add(1);
+        } else if queue.len() < MAX_PENDING {
+            queue.push((url.to_owned(), 0));
+        }
+    }
+
+    /// Record the episode-image window that was last enqueued, returning whether it changed.
+    ///
+    /// Render paths use this to detect selection moves without re-enqueueing every frame.
+    #[cfg(feature = "image")]
+    pub fn update_image_window(&self, first: String, last: String) -> bool {
+        let mut signature = self.image_window_signature.lock();
+        if signature.as_ref() == Some(&(first.clone(), last.clone())) {
+            return false;
+        }
+        *signature = Some((first, last));
+        true
     }
 
     #[cfg(feature = "streaming")]

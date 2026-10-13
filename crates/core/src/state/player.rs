@@ -37,6 +37,12 @@ impl PlayerState {
     /// # Note
     /// Because playback metadata stored inside the player state is buffered,
     /// the returned playback is estimated based on the available data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the last-updated timestamp is missing while a playback is stored, or if
+    /// the elapsed time cannot be represented as a `chrono::Duration`.
+    #[must_use]
     pub fn current_playback(&self) -> Option<rspotify::model::CurrentPlaybackContext> {
         let mut playback = self.playback.clone()?;
 
@@ -63,10 +69,16 @@ impl PlayerState {
         Some(playback)
     }
 
+    #[must_use]
     pub fn currently_playing(&self) -> Option<&rspotify::model::PlayableItem> {
         self.playback.as_ref().and_then(|p| p.item.as_ref())
     }
 
+    /// # Panics
+    ///
+    /// Panics if the last-updated timestamp or the stored progress is missing while a
+    /// playback is stored.
+    #[must_use]
     pub fn playback_progress(&self) -> Option<chrono::Duration> {
         match self.playback {
             None => None,
@@ -85,6 +97,7 @@ impl PlayerState {
         }
     }
 
+    #[must_use]
     pub fn playing_context_id(&self) -> Option<ContextId> {
         match self.playback {
             Some(ref playback) => match playback.context {

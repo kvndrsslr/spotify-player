@@ -1,20 +1,18 @@
-mod auth;
 mod cli;
-mod client;
-mod command;
-mod config;
 mod event;
+mod frontend_config;
 mod key;
-mod log_layer;
-#[cfg(feature = "media-control")]
-mod media_control;
-mod playlist_folders;
-mod state;
-#[cfg(feature = "streaming")]
-mod streaming;
-mod token;
+mod keymap;
+mod theme;
 mod ui;
-mod utils;
+
+// The core crate owns the model, state, client, configuration and command execution.
+// Re-exporting its modules keeps the frontend's `crate::…` paths unchanged.
+#[cfg(feature = "media-control")]
+use spotify_player_core::media_control;
+#[cfg(feature = "streaming")]
+use spotify_player_core::visualization;
+use spotify_player_core::{auth, client, command, config, controller, log_layer, state, utils};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -180,11 +178,15 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         })?;
 
     if !state.is_daemon {
+        // the TUI owns its own state: the theme and the terminal size are resolved here,
+        // not while constructing the shared application state.
+        let ui_state = std::sync::Arc::new(parking_lot::Mutex::new(ui::UIState::new()));
+
         // The image picker must run before the terminal is set up: it queries the terminal on
         // stdin and has to clean up after a query that is never answered before `init_terminal`
         // reads a cursor position. See `ui::init_image_picker`.
         #[cfg(feature = "image")]
-        ui::init_image_picker(state).context("initialize image picker")?;
+        ui::init_image_picker(&ui_state).context("initialize image picker")?;
         let terminal = ui::init_terminal().context("initialize terminal")?;
 
         // terminal event handler task
@@ -193,15 +195,16 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
             .spawn({
                 let client_pub = client_pub.clone();
                 let state = state.clone();
+                let ui_state = ui_state.clone();
                 move || {
-                    event::start_event_handler(&state, &client_pub);
+                    event::start_event_handler(&state, &ui_state, &client_pub);
                 }
             })?;
 
         // application UI task
         std::thread::Builder::new().name("ui".to_string()).spawn({
             let state = state.clone();
-            move || ui::run(&state, terminal)
+            move || ui::run(&state, &ui_state, terminal)
         })?;
     }
 
@@ -291,6 +294,9 @@ fn main() -> Result<()> {
         }
         config::set_config(configs);
     }
+
+    // initialize the frontend (theme + keymap) configs
+    frontend_config::set(frontend_config::FrontendConfigs::new(&config_folder)?);
 
     match args.subcommand() {
         None => {

@@ -148,6 +148,10 @@ fn execute_player_event_hook_command(
 }
 
 /// Create a new streaming connection
+///
+/// # Panics
+///
+/// Panics if no audio backend for the enabled backend feature can be found.
 pub async fn new_connection(
     client: AppClient,
     state: SharedState,
@@ -208,7 +212,7 @@ pub async fn new_connection(
             move || -> Box<dyn Sink> {
                 let real = backend(None, AudioFormat::default());
                 if let Some(ref bands) = vis_bands {
-                    Box::new(crate::ui::streaming::VisualizationSink::new(
+                    Box::new(crate::visualization::VisualizationSink::new(
                         real,
                         Arc::clone(bands),
                         // librespot defaults to 44100 Hz; adjust here if

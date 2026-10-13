@@ -5,6 +5,7 @@ use rspotify::model::Id;
 use crate::state::{Playlist, PlaylistFolder, PlaylistFolderItem, PlaylistFolderNode};
 
 /// Structurize a flat input playlist according to the playlist folder nodes
+#[must_use]
 pub fn structurize(
     playlists: Vec<Playlist>,
     nodes: &[PlaylistFolderNode],

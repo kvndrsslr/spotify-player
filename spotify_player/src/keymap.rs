@@ -347,7 +347,7 @@ impl KeymapConfig {
     /// parses a list of keymaps from the keymap config file in `path` folder
     /// and updates the current keymaps accordingly.
     fn parse_config_file(&mut self, path: &std::path::Path) -> Result<()> {
-        let file_path = path.join(super::KEYMAP_CONFIG_FILE);
+        let file_path = path.join(crate::config::KEYMAP_CONFIG_FILE);
         match std::fs::read_to_string(&file_path) {
             Err(err) => {
                 tracing::warn!(

@@ -1,9 +1,9 @@
 use crate::{command::Command, utils::filtered_items_from_query};
 
 use super::{
-    config, utils, utils::construct_and_render_block, Borders, Cell, Constraint, Frame, Layout,
-    Paragraph, PlaylistCreateCurrentField, PlaylistPopupAction, PopupState, Rect, Row, SharedState,
-    Table, UIStateGuard,
+    single_line_input, utils, utils::construct_and_render_block, Borders, Cell, Constraint, Ctx,
+    Frame, Layout, Paragraph, PlaylistCreateCurrentField, PlaylistPopupAction, PopupState, Rect,
+    Row, SharedState, Table,
 };
 
 const SHORTCUT_TABLE_N_COLUMNS: usize = 3;
@@ -18,7 +18,7 @@ const SHORTCUT_TABLE_CONSTRAINS: [Constraint; SHORTCUT_TABLE_N_COLUMNS] =
 pub fn render_popup(
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) -> (Rect, bool) {
     match ui.popup {
@@ -38,7 +38,7 @@ pub fn render_popup(
 
                 let name_input = construct_and_render_block(
                     "Enter Name for New Playlist:",
-                    &ui.theme,
+                    &ui.tui.theme,
                     Borders::ALL,
                     frame,
                     popup_chunks[0],
@@ -46,18 +46,24 @@ pub fn render_popup(
 
                 let desc_input = construct_and_render_block(
                     "Enter Description for New Playlist:",
-                    &ui.theme,
+                    &ui.tui.theme,
                     Borders::ALL,
                     frame,
                     popup_chunks[1],
                 );
 
                 frame.render_widget(
-                    name.widget(PlaylistCreateCurrentField::Name == *current_field),
+                    single_line_input::render(
+                        name,
+                        PlaylistCreateCurrentField::Name == *current_field,
+                    ),
                     name_input,
                 );
                 frame.render_widget(
-                    desc.widget(PlaylistCreateCurrentField::Desc == *current_field),
+                    single_line_input::render(
+                        desc,
+                        PlaylistCreateCurrentField::Desc == *current_field,
+                    ),
                     desc_input,
                 );
                 (chunks[0], true)
@@ -66,8 +72,13 @@ pub fn render_popup(
                 let chunks =
                     Layout::vertical([Constraint::Fill(0), Constraint::Length(3)]).split(rect);
 
-                let rect =
-                    construct_and_render_block("Search", &ui.theme, Borders::ALL, frame, chunks[1]);
+                let rect = construct_and_render_block(
+                    "Search",
+                    &ui.tui.theme,
+                    Borders::ALL,
+                    frame,
+                    chunks[1],
+                );
 
                 frame.render_widget(Paragraph::new(format!("/{query}")), rect);
                 (chunks[0], true)
@@ -113,7 +124,7 @@ pub fn render_popup(
                 (rect, false)
             }
             PopupState::ThemeList(themes, ..) => {
-                let items = themes.iter().map(|t| (t.name.clone(), false)).collect();
+                let items = themes.iter().map(|name| (name.clone(), false)).collect();
 
                 let rect = render_list_popup(frame, rect, "Themes", items, 7, ui);
                 (rect, false)
@@ -161,7 +172,7 @@ pub fn render_popup(
                 // Render search input
                 let search_rect = construct_and_render_block(
                     "Search Playlists (type to search, backspace on empty to close)",
-                    &ui.theme,
+                    &ui.tui.theme,
                     Borders::ALL,
                     frame,
                     chunks[0],
@@ -211,7 +222,7 @@ pub fn render_popup(
 
                 let confirm_rect = construct_and_render_block(
                     "Confirm",
-                    &ui.theme,
+                    &ui.tui.theme,
                     Borders::ALL,
                     frame,
                     chunks[1],
@@ -232,28 +243,28 @@ fn render_list_popup(
     title: &str,
     items: Vec<(String, bool)>,
     length: u16,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) -> Rect {
     let chunks = Layout::vertical([Constraint::Fill(0), Constraint::Length(length)]).split(rect);
 
-    let rect = construct_and_render_block(title, &ui.theme, Borders::ALL, frame, chunks[1]);
+    let rect = construct_and_render_block(title, &ui.tui.theme, Borders::ALL, frame, chunks[1]);
     let selected_index = ui.popup.as_ref().and_then(PopupState::list_selected);
-    let (list, len) = utils::construct_list_widget(&ui.theme, items, true, selected_index);
+    let (list, len) = utils::construct_list_widget(&ui.tui.theme, items, true, selected_index);
 
     utils::render_list_window(
         frame,
         list,
         rect,
         len,
-        ui.popup.as_mut().unwrap().list_state_mut().unwrap(),
+        ui.popup.as_mut().unwrap().list_cursor_mut().unwrap(),
     );
 
     chunks[0]
 }
 
 /// Render a shortcut help popup to show the available shortcuts based on user's inputs
-pub fn render_shortcut_help_popup(frame: &mut Frame, ui: &mut UIStateGuard, rect: Rect) -> Rect {
-    let input = &ui.input_key_sequence;
+pub fn render_shortcut_help_popup(frame: &mut Frame, ui: &mut Ctx<'_>, rect: Rect) -> Rect {
+    let input = &ui.tui.input_key_sequence;
 
     // get the matches (keymaps) from the current key sequence input,
     // if there is at lease one match, render the shortcut help popup
@@ -261,7 +272,7 @@ pub fn render_shortcut_help_popup(frame: &mut Frame, ui: &mut UIStateGuard, rect
         if input.keys.is_empty() {
             vec![]
         } else {
-            config::get_config()
+            crate::frontend_config::get()
                 .keymap_config
                 .find_matched_prefix_keymaps(input)
                 .into_iter()
@@ -283,7 +294,7 @@ pub fn render_shortcut_help_popup(frame: &mut Frame, ui: &mut UIStateGuard, rect
         let chunks = Layout::vertical([Constraint::Fill(0), Constraint::Length(7)]).split(rect);
 
         let rect =
-            construct_and_render_block("Shortcuts", &ui.theme, Borders::ALL, frame, chunks[1]);
+            construct_and_render_block("Shortcuts", &ui.tui.theme, Borders::ALL, frame, chunks[1]);
 
         let help_table = Table::new(
             matches

@@ -4,10 +4,10 @@ use crate::{
         model::{Album, Artist, Episode, EpisodeId, Playlist, Show, Track, TrackId},
         ItemId,
     },
-    ui::single_line_input::LineInput,
 };
-use ratatui::widgets::ListState;
 use rspotify::model::PlaylistId;
+
+use super::{Cursor, TextInput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaylistCreateCurrentField {
@@ -20,16 +20,16 @@ pub enum PopupState {
     Search {
         query: String,
     },
-    UserPlaylistList(PlaylistPopupAction, ListState),
-    UserFollowedArtistList(ListState),
-    UserSavedAlbumList(ListState),
-    DeviceList(ListState),
-    ArtistList(ArtistPopupAction, Vec<Artist>, ListState),
-    ThemeList(Vec<crate::config::Theme>, ListState),
-    ActionList(Box<ActionListItem>, ListState),
+    UserPlaylistList(PlaylistPopupAction, Cursor),
+    UserFollowedArtistList(Cursor),
+    UserSavedAlbumList(Cursor),
+    DeviceList(Cursor),
+    ArtistList(ArtistPopupAction, Vec<Artist>, Cursor),
+    ThemeList(Vec<String>, Cursor),
+    ActionList(Box<ActionListItem>, Cursor),
     PlaylistCreate {
-        name: LineInput,
-        desc: LineInput,
+        name: TextInput,
+        desc: TextInput,
         current_field: PlaylistCreateCurrentField,
     },
     ConfirmAction {
@@ -84,8 +84,9 @@ pub enum ArtistPopupAction {
 }
 
 impl PopupState {
-    /// gets the (immutable) list state of a (list) popup
-    pub fn list_state(&self) -> Option<&ListState> {
+    /// Gets the (immutable) cursor of a list popup
+    #[must_use]
+    pub fn list_cursor(&self) -> Option<&Cursor> {
         match self {
             Self::DeviceList(list_state)
             | Self::UserPlaylistList(.., list_state)
@@ -98,8 +99,8 @@ impl PopupState {
         }
     }
 
-    /// gets the (mutable) list state of a (list) popup
-    pub fn list_state_mut(&mut self) -> Option<&mut ListState> {
+    /// Gets the (mutable) cursor of a list popup
+    pub fn list_cursor_mut(&mut self) -> Option<&mut Cursor> {
         match self {
             Self::DeviceList(list_state)
             | Self::UserPlaylistList(.., list_state)
@@ -113,8 +114,9 @@ impl PopupState {
     }
 
     /// gets the selected position of a (list) popup
+    #[must_use]
     pub fn list_selected(&self) -> Option<usize> {
-        match self.list_state() {
+        match self.list_cursor() {
             None => None,
             Some(state) => state.selected(),
         }
@@ -122,7 +124,7 @@ impl PopupState {
 
     /// selects a position in a (list) popup
     pub fn list_select(&mut self, id: Option<usize>) {
-        match self.list_state_mut() {
+        match self.list_cursor_mut() {
             None => {}
             Some(state) => state.select(id),
         }
@@ -130,6 +132,7 @@ impl PopupState {
 }
 
 impl ActionListItem {
+    #[must_use]
     pub fn n_actions(&self) -> usize {
         match self {
             ActionListItem::Track(.., actions)
@@ -141,6 +144,7 @@ impl ActionListItem {
         }
     }
 
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             ActionListItem::Track(track, ..) => &track.name,
@@ -152,6 +156,7 @@ impl ActionListItem {
         }
     }
 
+    #[must_use]
     pub fn actions_desc(&self) -> Vec<String> {
         match self {
             ActionListItem::Track(.., actions)

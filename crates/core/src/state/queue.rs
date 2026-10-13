@@ -95,6 +95,7 @@ impl CustomQueue {
     ///   "playing from" display and radio seed.
     /// - `autoplay`: whether to fetch radio tracks when the queue is exhausted
     ///   (sourced from device config).
+    #[must_use]
     pub fn new(
         tracks: Vec<PlayableId<'static>>,
         start_position: usize,
@@ -124,16 +125,19 @@ impl CustomQueue {
     // ── Accessors ──────────────────────────────────────────────────────
 
     /// The track URIs that make up the current batch sent to Spotify.
+    #[must_use]
     pub fn current_batch(&self) -> &[PlayableId<'static>] {
         &self.play_order[self.batch_start..self.batch_end]
     }
 
     /// The currently playing track.
+    #[must_use]
     pub fn current_track(&self) -> &PlayableId<'static> {
         &self.play_order[self.position]
     }
 
     /// All tracks after the current position (for queue UI display).
+    #[must_use]
     pub fn remaining_tracks(&self) -> &[PlayableId<'static>] {
         if self.position + 1 >= self.play_order.len() {
             &[]
@@ -143,52 +147,62 @@ impl CustomQueue {
     }
 
     /// The source context this queue was built from.
+    #[must_use]
     pub fn source_context(&self) -> Option<&ContextId> {
         self.source_context.as_ref()
     }
 
     /// Current shuffle mode.
+    #[must_use]
     pub fn shuffle_mode(&self) -> &ShuffleMode {
         &self.shuffle_mode
     }
 
     /// Current repeat state.
+    #[must_use]
     pub fn repeat(&self) -> rspotify::model::RepeatState {
         self.repeat
     }
 
     /// Current position within the play order.
+    #[must_use]
     pub fn position(&self) -> usize {
         self.position
     }
 
     /// Batch start index.
+    #[must_use]
     pub fn batch_start(&self) -> usize {
         self.batch_start
     }
 
     /// Batch end index (exclusive).
+    #[must_use]
     pub fn batch_end(&self) -> usize {
         self.batch_end
     }
 
     /// Total number of tracks in the queue.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.play_order.len()
     }
 
     /// Whether the queue is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.play_order.is_empty()
     }
 
     /// Timestamp of last batch transition (for consistency-check cooldown).
+    #[must_use]
     pub fn last_batch_transition(&self) -> Option<Instant> {
         self.last_batch_transition
     }
 
     /// The expected next track in the play order (if any and within the batch).
     /// Used for queue consistency checking.
+    #[must_use]
     pub fn expected_next_track(&self) -> Option<&PlayableId<'static>> {
         let next = self.position + 1;
         if next < self.batch_end {
@@ -199,11 +213,13 @@ impl CustomQueue {
     }
 
     /// Whether the current track is the last in the current batch.
+    #[must_use]
     pub fn is_at_batch_end(&self) -> bool {
         self.position + 1 >= self.batch_end
     }
 
     /// Whether the current track is the first in the current batch.
+    #[must_use]
     pub fn is_at_batch_start(&self) -> bool {
         self.position == self.batch_start
     }

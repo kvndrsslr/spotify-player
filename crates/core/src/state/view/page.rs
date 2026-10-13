@@ -1,8 +1,6 @@
-use crate::{
-    state::model::{Category, Context, ContextId},
-    ui::single_line_input::LineInput,
-};
-use ratatui::widgets::{ListState, TableState};
+use crate::state::model::{Category, Context, ContextId};
+
+use super::{Cursor, TextInput};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PageState {
@@ -15,7 +13,7 @@ pub enum PageState {
         state: Option<ContextPageUIState>,
     },
     Search {
-        line_input: LineInput,
+        line_input: TextInput,
         current_query: String,
         state: SearchPageUIState,
     },
@@ -52,22 +50,22 @@ pub enum PageType {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LibraryPageUIState {
-    pub playlist_list: ListState,
-    pub saved_album_list: ListState,
-    pub followed_artist_list: ListState,
-    pub saved_show_list: ListState,
+    pub playlist_list: Cursor,
+    pub saved_album_list: Cursor,
+    pub followed_artist_list: Cursor,
+    pub saved_show_list: Cursor,
     pub focus: LibraryFocusState,
     pub playlist_folder_id: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchPageUIState {
-    pub track_list: ListState,
-    pub album_list: ListState,
-    pub artist_list: ListState,
-    pub playlist_list: ListState,
-    pub show_list: ListState,
-    pub episode_list: ListState,
+    pub track_list: Cursor,
+    pub album_list: Cursor,
+    pub artist_list: Cursor,
+    pub playlist_list: Cursor,
+    pub show_list: Cursor,
+    pub episode_list: Cursor,
     pub focus: SearchFocusState,
 }
 
@@ -80,23 +78,23 @@ pub enum ContextPageType {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContextPageUIState {
     Playlist {
-        track_table: TableState,
+        track_table: Cursor,
     },
     Album {
-        track_table: TableState,
+        track_table: Cursor,
     },
     Artist {
-        top_track_table: TableState,
-        album_table: TableState,
-        related_artist_list: ListState,
-        liked_track_table: TableState,
+        top_track_table: Cursor,
+        album_table: Cursor,
+        related_artist_list: Cursor,
+        liked_track_table: Cursor,
         focus: ArtistFocusState,
     },
     Tracks {
-        track_table: TableState,
+        track_table: Cursor,
     },
     Show {
-        episode_table: TableState,
+        episode_table: Cursor,
         focus: ShowFocusState,
         description_scroll: u16,
     },
@@ -137,23 +135,19 @@ pub enum SearchFocusState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrowsePageUIState {
-    CategoryList {
-        state: ListState,
-    },
-    CategoryPlaylistList {
-        category: Category,
-        state: ListState,
-    },
+    CategoryList { state: Cursor },
+    CategoryPlaylistList { category: Category, state: Cursor },
 }
 
 pub enum MutableWindowState<'a> {
-    Table(&'a mut TableState),
-    List(&'a mut ListState),
+    Table(&'a mut Cursor),
+    List(&'a mut Cursor),
     Scroll(&'a mut usize),
 }
 
 impl PageState {
     /// The type of the page.
+    #[must_use]
     pub fn page_type(&self) -> PageType {
         match self {
             PageState::Library { .. } => PageType::Library,
@@ -237,7 +231,7 @@ impl PageState {
         }
     }
 
-    /// Clamp a `TableState`/`ListState` cursor so it cannot point past the end of its list.
+    /// Clamp a cursor so it cannot point past the end of its list.
     fn clamp_cursor(selected: Option<usize>, len: usize) -> Option<usize> {
         match selected {
             Some(selected) if selected >= len => {
@@ -336,34 +330,49 @@ impl PageState {
     }
 }
 
+impl Default for LibraryPageUIState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LibraryPageUIState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            playlist_list: ListState::default(),
-            saved_album_list: ListState::default(),
-            followed_artist_list: ListState::default(),
-            saved_show_list: ListState::default(),
+            playlist_list: Cursor::default(),
+            saved_album_list: Cursor::default(),
+            followed_artist_list: Cursor::default(),
+            saved_show_list: Cursor::default(),
             focus: LibraryFocusState::Playlists,
             playlist_folder_id: 0,
         }
     }
 }
 
+impl Default for SearchPageUIState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SearchPageUIState {
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            track_list: ListState::default(),
-            album_list: ListState::default(),
-            artist_list: ListState::default(),
-            playlist_list: ListState::default(),
-            show_list: ListState::default(),
-            episode_list: ListState::default(),
+            track_list: Cursor::default(),
+            album_list: Cursor::default(),
+            artist_list: Cursor::default(),
+            playlist_list: Cursor::default(),
+            show_list: Cursor::default(),
+            episode_list: Cursor::default(),
             focus: SearchFocusState::Input,
         }
     }
 }
 
 impl ContextPageType {
+    #[must_use]
     pub fn title(&self) -> String {
         match self {
             ContextPageType::CurrentPlaying => String::from("Current Playing"),
@@ -379,37 +388,42 @@ impl ContextPageType {
 }
 
 impl ContextPageUIState {
+    #[must_use]
     pub fn new_playlist() -> Self {
         Self::Playlist {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         }
     }
 
+    #[must_use]
     pub fn new_album() -> Self {
         Self::Album {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         }
     }
 
+    #[must_use]
     pub fn new_artist() -> Self {
         Self::Artist {
-            top_track_table: TableState::default(),
-            album_table: TableState::default(),
-            related_artist_list: ListState::default(),
-            liked_track_table: TableState::default(),
+            top_track_table: Cursor::default(),
+            album_table: Cursor::default(),
+            related_artist_list: Cursor::default(),
+            liked_track_table: Cursor::default(),
             focus: ArtistFocusState::TopTracks,
         }
     }
 
+    #[must_use]
     pub fn new_tracks() -> Self {
         Self::Tracks {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         }
     }
 
+    #[must_use]
     pub fn new_show() -> Self {
         Self::Show {
-            episode_table: TableState::default(),
+            episode_table: Cursor::default(),
             focus: ShowFocusState::Episodes,
             description_scroll: 0,
         }
@@ -419,18 +433,17 @@ impl ContextPageUIState {
 impl MutableWindowState<'_> {
     pub fn select(&mut self, id: usize) {
         match self {
-            Self::List(state) => state.select(Some(id)),
-            Self::Table(state) => state.select(Some(id)),
+            Self::List(state) | Self::Table(state) => state.select(Some(id)),
             Self::Scroll(scroll_offset) => {
                 **scroll_offset = id;
             }
         }
     }
 
+    #[must_use]
     pub fn selected(&self) -> Option<usize> {
         match self {
-            Self::List(state) => state.selected(),
-            Self::Table(state) => state.selected(),
+            Self::List(state) | Self::Table(state) => state.selected(),
             Self::Scroll(scroll_offset) => Some(**scroll_offset),
         }
     }
@@ -574,7 +587,6 @@ mod tests {
         Album, AlbumId, Artist, ArtistId, Episode, EpisodeId, Playlist, PlaylistId, Show, ShowId,
         Track, TrackId, UserId,
     };
-    use rspotify::model::Id;
 
     fn show_page(selected: usize) -> PageState {
         let mut page = PageState::Context {
@@ -583,7 +595,7 @@ mod tests {
                 ShowId::from_id("1").expect("valid id").clone_static(),
             )),
             state: Some(ContextPageUIState::Show {
-                episode_table: TableState::default(),
+                episode_table: Cursor::default(),
                 focus: ShowFocusState::Episodes,
                 description_scroll: 0,
             }),
@@ -738,7 +750,7 @@ mod tests {
     #[test]
     fn playlist_cursor_clamped_to_context() {
         let mut page = context_page(ContextPageUIState::Playlist {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         });
         page.select(10);
 
@@ -758,7 +770,7 @@ mod tests {
     fn in_bounds_cursor_and_none_untouched() {
         // A cursor already inside the list is left alone.
         let mut page = context_page(ContextPageUIState::Tracks {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         });
         page.select(1);
         page.clamp_context_selection(&Context::Tracks {
@@ -773,7 +785,7 @@ mod tests {
 
         // A `None` cursor stays `None`.
         let mut page = context_page(ContextPageUIState::Tracks {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         });
         page.clamp_context_selection(&Context::Tracks {
             tracks: vec![track("t1")],
@@ -785,10 +797,10 @@ mod tests {
     #[test]
     fn artist_cursors_clamped_by_their_own_lengths() {
         let mut page = context_page(ContextPageUIState::Artist {
-            top_track_table: TableState::default(),
-            album_table: TableState::default(),
-            related_artist_list: ListState::default(),
-            liked_track_table: TableState::default(),
+            top_track_table: Cursor::default(),
+            album_table: Cursor::default(),
+            related_artist_list: Cursor::default(),
+            liked_track_table: Cursor::default(),
             focus: ArtistFocusState::TopTracks,
         });
         let PageState::Context {
@@ -870,7 +882,7 @@ mod tests {
     #[test]
     fn variant_mismatch_is_noop() {
         let mut page = context_page(ContextPageUIState::Playlist {
-            track_table: TableState::default(),
+            track_table: Cursor::default(),
         });
         page.select(20);
 

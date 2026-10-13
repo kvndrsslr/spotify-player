@@ -1,6 +1,5 @@
 use crate::config;
-use crate::ui::utils::to_bidi_string;
-use crate::utils::map_join;
+use crate::utils::{map_join, to_bidi_string};
 use html_escape::decode_html_entities;
 pub use rspotify::model::{
     AlbumId, ArtistId, EpisodeId, Id, PlayableId, PlaylistId, ShowId, TrackId, UserId,
@@ -249,11 +248,13 @@ pub struct Category {
 impl Context {
     /// Whether the cached data is known to be incomplete (a show whose episode list is only
     /// partially loaded), which must not be served without refreshing.
+    #[must_use]
     pub fn is_incomplete(&self) -> bool {
         matches!(self, Context::Show { episodes, total_episodes, .. } if episodes.len() < *total_episodes)
     }
 
     /// gets the context's description
+    #[must_use]
     pub fn description(&self) -> String {
         match self {
             Context::Album {
@@ -315,6 +316,7 @@ fn play_time(tracks: &[Track]) -> String {
 }
 
 impl ContextId {
+    #[must_use]
     pub fn uri(&self) -> String {
         match self {
             Self::Album(id) => id.uri(),
@@ -327,6 +329,7 @@ impl ContextId {
 }
 
 impl TrackOrder {
+    #[must_use]
     pub fn compare(&self, x: &Track, y: &Track) -> std::cmp::Ordering {
         match *self {
             Self::AddedAt => x.added_at.cmp(&y.added_at),
@@ -340,6 +343,7 @@ impl TrackOrder {
 
 impl Device {
     /// tries to convert from a `rspotify::model::Device` into `Device`
+    #[must_use]
     pub fn try_from_device(device: rspotify::model::Device) -> Option<Self> {
         Some(Self {
             id: device.id?,
@@ -351,11 +355,13 @@ impl Device {
 
 impl Track {
     /// gets the track's artists information
+    #[must_use]
     pub fn artists_info(&self) -> String {
         map_join(&self.artists, |a| &a.name, ", ")
     }
 
     /// gets the track's album information
+    #[must_use]
     pub fn album_info(&self) -> String {
         self.album
             .as_ref()
@@ -364,6 +370,7 @@ impl Track {
     }
 
     /// gets the track's name, including an explicit label
+    #[must_use]
     pub fn display_name(&self) -> Cow<'_, str> {
         if self.explicit {
             Cow::Owned(format!(
@@ -377,6 +384,11 @@ impl Track {
     }
 
     /// tries to convert from a `rspotify::model::SimplifiedTrack` into `Track`
+    ///
+    /// # Panics
+    ///
+    /// Panics if the track's duration is out of range for a `std::time::Duration`.
+    #[must_use]
     pub fn try_from_simplified_track(track: rspotify::model::SimplifiedTrack) -> Option<Self> {
         if track.is_playable.unwrap_or(true) {
             let id = match track.linked_from {
@@ -422,11 +434,13 @@ impl Track {
     }
 
     /// tries to convert from a `rspotify::model::FullTrack` into `Track`
+    #[must_use]
     pub fn try_from_full_track(track: rspotify::model::FullTrack) -> Option<Self> {
         Track::try_from_full_track_with_date(track, None)
     }
 
     /// tries to convert from a `rspotify::model::PlaylistItem` into `Track`
+    #[must_use]
     pub fn try_from_playlist_item(item: rspotify::model::PlaylistItem) -> Option<Self> {
         let rspotify::model::PlayableItem::Track(track) = item.track? else {
             return None;
@@ -452,6 +466,7 @@ impl BidiDisplay for Track {}
 
 impl Album {
     /// tries to convert from a `rspotify::model::SimplifiedAlbum` into `Album`
+    #[must_use]
     pub fn try_from_simplified_album(album: rspotify::model::SimplifiedAlbum) -> Option<Self> {
         Some(Self {
             id: album.id?,
@@ -472,6 +487,7 @@ impl Album {
     }
 
     /// gets the album's release year
+    #[must_use]
     pub fn year(&self) -> String {
         self.release_date
             .split('-')
@@ -481,6 +497,7 @@ impl Album {
     }
 
     /// gets the album type
+    #[must_use]
     pub fn album_type(&self) -> String {
         match self.typ {
             Some(t) => <&str>::from(t).to_string(),
@@ -526,6 +543,7 @@ impl BidiDisplay for Album {}
 
 impl Artist {
     /// tries to convert from a `rspotify::model::SimplifiedArtist` into `Artist`
+    #[must_use]
     pub fn try_from_simplified_artist(artist: rspotify::model::SimplifiedArtist) -> Option<Self> {
         Some(Self {
             id: artist.id?,
@@ -730,6 +748,7 @@ impl TracksId {
 
 impl Playback {
     /// creates new playback with a specified offset based on the current playback
+    #[must_use]
     pub fn uri_offset(&self, uri: String, limit: usize) -> Self {
         match self {
             Playback::Context(id, _) => {
@@ -759,6 +778,7 @@ impl Playback {
 }
 
 impl PlaybackMetadata {
+    #[must_use]
     pub fn from_playback(p: &rspotify::model::CurrentPlaybackContext) -> Self {
         Self {
             device_name: p.device.name.clone(),

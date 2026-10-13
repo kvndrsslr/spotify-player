@@ -185,6 +185,7 @@ impl From<PlaylistFolderItem> for ActionContext {
 }
 
 impl ActionContext {
+    #[must_use]
     pub fn get_available_actions(&self, data: &DataReadGuard) -> Vec<Action> {
         match self {
             Self::Track(track) => construct_track_actions(track, data),
@@ -200,6 +201,7 @@ impl ActionContext {
 }
 
 /// constructs a list of actions on a track
+#[must_use]
 pub fn construct_track_actions(track: &Track, data: &DataReadGuard) -> Vec<Action> {
     let mut actions = vec![
         Action::GoToArtist,
@@ -222,6 +224,7 @@ pub fn construct_track_actions(track: &Track, data: &DataReadGuard) -> Vec<Actio
 }
 
 /// constructs a list of actions on an album
+#[must_use]
 pub fn construct_album_actions(album: &Album, data: &DataReadGuard) -> Vec<Action> {
     let mut actions = vec![
         Action::GoToArtist,
@@ -239,6 +242,7 @@ pub fn construct_album_actions(album: &Album, data: &DataReadGuard) -> Vec<Actio
 }
 
 /// constructs a list of actions on an artist
+#[must_use]
 pub fn construct_artist_actions(artist: &Artist, data: &DataReadGuard) -> Vec<Action> {
     let mut actions = vec![Action::GoToRadio, Action::CopyLink];
 
@@ -256,6 +260,7 @@ pub fn construct_artist_actions(artist: &Artist, data: &DataReadGuard) -> Vec<Ac
 }
 
 /// constructs a list of actions on an playlist
+#[must_use]
 pub fn construct_playlist_actions(playlist: &Playlist, data: &DataReadGuard) -> Vec<Action> {
     let mut actions = vec![Action::GoToRadio, Action::CopyLink];
 
@@ -273,6 +278,7 @@ pub fn construct_playlist_actions(playlist: &Playlist, data: &DataReadGuard) -> 
 }
 
 /// constructs a list of actions on a show
+#[must_use]
 pub fn construct_show_actions(show: &Show, data: &DataReadGuard) -> Vec<Action> {
     let mut actions = vec![Action::CopyLink];
     if data.user_data.saved_shows.iter().any(|s| s.id == show.id) {
@@ -284,6 +290,7 @@ pub fn construct_show_actions(show: &Show, data: &DataReadGuard) -> Vec<Action> 
 }
 
 /// constructs a list of actions on an episode
+#[must_use]
 pub fn construct_episode_actions(episode: &Episode, _data: &DataReadGuard) -> Vec<Action> {
     let mut actions = vec![Action::CopyLink, Action::AddToPlaylist, Action::AddToQueue];
     if episode.show.is_some() {
@@ -294,6 +301,7 @@ pub fn construct_episode_actions(episode: &Episode, _data: &DataReadGuard) -> Ve
 }
 
 impl Command {
+    #[must_use]
     pub fn desc(self) -> String {
         if let Self::VolumeChange { offset } = self {
             return format!("change playback volume by {offset}");

@@ -144,12 +144,14 @@ pub fn new_api_client() -> Result<WebApiClient> {
 #[cfg(feature = "streaming")]
 impl AppClient {
     /// Returns a clone of the sender used to signal an unexpected Connect link drop.
+    #[must_use]
     pub fn stream_drop_sender(&self) -> flume::Sender<()> {
         self.stream_drop_tx.clone()
     }
 
     /// Returns the receiver that yields a signal whenever the integrated Connect
     /// link drops unexpectedly. Consumed by the session watcher to reconnect.
+    #[must_use]
     pub fn stream_drop_receiver(&self) -> flume::Receiver<()> {
         self.stream_drop_rx.clone()
     }
@@ -157,6 +159,7 @@ impl AppClient {
     /// Returns the current streaming-connection epoch. A spirc watchdog task
     /// captures this at spawn; an unexpected link drop is signalled only if the
     /// epoch is unchanged when the task ends.
+    #[must_use]
     pub fn stream_epoch(&self) -> u64 {
         self.stream_epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -395,14 +398,8 @@ impl AppClient {
     /// Refetch image urls that render paths reported missing, with per-url exponential
     /// backoff; runs on playback polls and manual refreshes.
     #[cfg(feature = "image")]
-    pub(crate) fn recover_missing_images(&self, state: &SharedState) {
-        let pending = {
-            let mut guard = state.ui.try_lock();
-            match guard.as_mut() {
-                Some(ui) => std::mem::take(&mut ui.image_fetch_queue),
-                None => return,
-            }
-        };
+    pub fn recover_missing_images(&self, state: &SharedState) {
+        let pending = std::mem::take(&mut *state.image_fetch_queue.lock());
 
         for (url, _) in pending {
             // Skip urls that are already satisfied — window prefetch spam and successful
@@ -437,9 +434,7 @@ impl AppClient {
                 if let Err(err) = client.fetch_episode_image(&state, &url).await {
                     tracing::warn!("Image refetch failed for {url}: {err:#}");
                     // Requeue with an incremented attempt; the next drain honors backoff.
-                    if let Some(mut ui) = state.ui.try_lock() {
-                        ui.queue_image_fetch(&url);
-                    }
+                    state.queue_image_fetch(&url);
                 } else {
                     client.image_retries.lock().remove(&url);
                 }
@@ -1016,8 +1011,8 @@ impl AppClient {
             }
 
             // A background refresh may have shrunk the list the user is looking at.
-            let mut ui = state.ui.lock();
-            let page = ui.current_page_mut();
+            let mut view = state.view.lock();
+            let page = view.current_page_mut();
             if matches!(page, PageState::Context { id: Some(page_id), .. } if page_id.uri() == uri)
             {
                 page.clamp_context_selection(&ctx);
@@ -1081,7 +1076,7 @@ impl AppClient {
                 if is_volume {
                     // The commanded target is now applied locally; drop the pending rebase
                     // so the next scroll tick computes from fresh state.
-                    state.ui.lock().volume_target = None;
+                    *state.volume_target.lock() = None;
                 }
                 if let Some(position) = seek_to {
                     // Reflect a seek immediately in local state so the progress bar jumps right

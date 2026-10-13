@@ -292,7 +292,6 @@ fn write_iterm2(escape: &str, area: Rect) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex;
     use std::sync::LazyLock;
 
     static AREA: LazyLock<Rect> = LazyLock::new(|| Rect::new(1, 1, 4, 2));
@@ -378,7 +377,7 @@ mod tests {
 
         let painted = (AREA.top()..AREA.bottom())
             .flat_map(|y| (AREA.left()..AREA.right()).map(move |x| (x, y)))
-            .filter(|&(x, y)| terminal.backend().buffer().get(x, y).symbol() != " ")
+            .filter(|&(x, y)| terminal.backend().buffer()[(x, y)].symbol() != " ")
             .count();
         assert!(painted > 0, "halfblocks cover left no glyphs in its area");
     }

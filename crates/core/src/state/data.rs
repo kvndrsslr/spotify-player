@@ -78,10 +78,12 @@ pub struct EpisodeImageRing {
 impl EpisodeImageRing {
     pub const CAP: usize = 64;
 
+    #[must_use]
     pub fn get(&self, url: &str) -> Option<&image::DynamicImage> {
         self.buf.iter().find(|(u, _)| u == url).map(|(_, img)| img)
     }
 
+    #[must_use]
     pub fn contains(&self, url: &str) -> bool {
         self.buf.iter().any(|(u, _)| u == url)
     }
@@ -98,7 +100,14 @@ impl EpisodeImageRing {
     }
 }
 
+impl Default for MemoryCaches {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryCaches {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             context: ttl_cache::TtlCache::new(64),
@@ -121,6 +130,7 @@ pub struct BrowseData {
 }
 
 impl AppData {
+    #[must_use]
     pub fn new(cache_folder: &Path) -> Self {
         Self {
             user_data: UserData::new_from_file_caches(cache_folder),
@@ -146,6 +156,7 @@ impl AppData {
         })
     }
 
+    #[must_use]
     pub fn context_tracks(&self, id: &ContextId) -> Option<&Vec<Track>> {
         let c = self.caches.context.get(&id.uri())?;
         Some(match c {
@@ -164,6 +175,7 @@ impl AppData {
 
 impl UserData {
     /// Construct a new user data based on file caches
+    #[must_use]
     pub fn new_from_file_caches(cache_folder: &Path) -> Self {
         Self {
             user: None,
@@ -191,6 +203,7 @@ impl UserData {
     ///
     /// If `folder_id` is provided, returns items in the given folder id.
     /// Otherwise, returns the all items.
+    #[must_use]
     pub fn modifiable_playlist_items(&self, folder_id: Option<usize>) -> Vec<&PlaylistFolderItem> {
         match self.user {
             None => vec![],
@@ -218,6 +231,7 @@ impl UserData {
     }
 
     /// Get playlists items for the given folder id
+    #[must_use]
     pub fn folder_playlists_items(&self, folder_id: usize) -> Vec<&PlaylistFolderItem> {
         self.playlists
             .iter()
@@ -229,11 +243,13 @@ impl UserData {
     }
 
     /// Check if a track is a liked track
+    #[must_use]
     pub fn is_liked_track(&self, track: &Track) -> bool {
         self.saved_tracks.contains_key(&track.id.uri())
     }
 
     /// Get the user's liked tracks by the given artist, sorted by liked date (newest first)
+    #[must_use]
     pub fn liked_tracks_by_artist(&self, artist: &Artist) -> Vec<Track> {
         let mut tracks: Vec<Track> = self
             .saved_tracks
@@ -246,6 +262,7 @@ impl UserData {
     }
 
     /// Check if a playlist is followed
+    #[must_use]
     pub fn is_followed_playlist(&self, playlist: &Playlist) -> bool {
         self.playlists.iter().any(|x| match x {
             PlaylistFolderItem::Playlist(p) => p.id == playlist.id,
@@ -265,6 +282,9 @@ pub fn store_data_into_file_cache<T: Serialize>(
     Ok(())
 }
 
+/// # Panics
+///
+/// Panics if the cache file disappears between the existence check and the open call.
 pub fn load_data_from_file_cache<T>(key: FileCacheKey, cache_folder: &Path) -> Option<T>
 where
     T: DeserializeOwned,

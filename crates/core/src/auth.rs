@@ -62,6 +62,7 @@ impl Default for AuthConfig {
 
 impl AuthConfig {
     /// Create a `librespot::Session` from authentication configs
+    #[must_use]
     pub fn session(&self) -> Session {
         let session_config = config::get_config().app_config.session_config();
         Session::new(session_config, Some(self.cache.clone()))
@@ -132,6 +133,10 @@ pub fn get_creds(auth_config: &AuthConfig, reauth: bool, use_cached: bool) -> Re
 ///
 /// When `force` is set, any cached token is ignored and a fresh interactive authorization flow is
 /// always run. This is used by the `authenticate` CLI command to re-authenticate on demand.
+///
+/// # Panics
+///
+/// Panics if the API client's token mutex is poisoned.
 pub async fn prompt_for_user_token(
     client: &mut crate::client::WebApiClient,
     force: bool,

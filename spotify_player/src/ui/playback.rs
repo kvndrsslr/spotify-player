@@ -1,12 +1,10 @@
 use super::{
-    config, utils::construct_and_render_block, Alignment, Borders, Constraint, Frame, Gauge,
-    Layout, Line, LineGauge, Modifier, Paragraph, PlaybackMetadata, Rect, SharedState, Span, Style,
-    Text, UIStateGuard, Wrap,
+    config, utils::construct_and_render_block, Alignment, Borders, Constraint, Ctx, Frame, Gauge,
+    Layout, Line, LineGauge, Modifier, Paragraph, PlaybackMetadata, ProgressBarLayout, Rect,
+    SharedState, Span, Style, Text, Wrap,
 };
-use crate::{
-    state::Track,
-    ui::utils::{format_genres, to_bidi_string},
-};
+use crate::utils::to_bidi_string;
+use crate::{state::Track, ui::utils::format_genres};
 use rspotify::model::Id;
 
 /// Render a playback window showing information about the current playback, which includes
@@ -17,11 +15,11 @@ use rspotify::model::Id;
 pub fn render_playback_window(
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) -> Rect {
     let (rect, other_rect) = split_rect_for_playback_window(state, rect);
-    let rect = construct_and_render_block("Playback", &ui.theme, Borders::ALL, frame, rect);
+    let rect = construct_and_render_block("Playback", &ui.tui.theme, Borders::ALL, frame, rect);
 
     let player = state.player.read();
     if let Some(ref playback) = player.playback {
@@ -36,7 +34,7 @@ pub fn render_playback_window(
                 {
                     let chunks = Layout::vertical([
                         Constraint::Fill(0),
-                        Constraint::Length(super::streaming::VIS_HEIGHT),
+                        Constraint::Length(crate::visualization::VIS_HEIGHT),
                     ])
                     .split(rect);
                     (chunks[0], Some(chunks[1]))
@@ -55,11 +53,12 @@ pub fn render_playback_window(
                         match configs.app_config.progress_bar_position {
                             config::ProgressBarPosition::Bottom => {
                                 let ver_chunks = split_rect_for_progress_bar(rect); // rect, progress_bar_rect
-                                let hor_chunks = split_rect_for_cover_img(ver_chunks.0, &ui.picker); // cover_img_rect, metadata_rect
+                                let hor_chunks =
+                                    split_rect_for_cover_img(ver_chunks.0, &ui.tui.picker); // cover_img_rect, metadata_rect
                                 (hor_chunks.1, hor_chunks.0, ver_chunks.1)
                             }
                             config::ProgressBarPosition::Right => {
-                                let hor_chunks = split_rect_for_cover_img(rect, &ui.picker); // cover_img_rect, rect
+                                let hor_chunks = split_rect_for_cover_img(rect, &ui.tui.picker); // cover_img_rect, rect
                                 let ver_chunks = split_rect_for_progress_bar(hor_chunks.1); // metadata_rect, progress_bar_rect
                                 (ver_chunks.0, hor_chunks.0, ver_chunks.1)
                             }
@@ -77,8 +76,8 @@ pub fn render_playback_window(
                     if let Some(url) = url {
                         let data = state.data.read();
                         if let Some(img) = data.caches.images.get(&url) {
-                            let picker = ui.picker.clone();
-                            ui.image_compositor.render(
+                            let picker = ui.tui.picker.clone();
+                            ui.tui.image_compositor.render(
                                 frame,
                                 &picker,
                                 "playback",
@@ -87,7 +86,7 @@ pub fn render_playback_window(
                                 cover_img_rect,
                             );
                         } else {
-                            ui.queue_image_fetch(&url);
+                            state.queue_image_fetch(&url);
                         }
                     }
                     (metadata_rect, progress_bar_rect)
@@ -144,7 +143,7 @@ pub fn render_playback_window(
         .split(rect);
         frame.render_widget(
             Paragraph::new(format!("{} Loading...", SPINNER_FRAMES[frame_idx]))
-                .style(ui.theme.playback_metadata())
+                .style(ui.tui.theme.playback_metadata())
                 .alignment(Alignment::Center),
             vertical_chunks[1],
         );
@@ -199,7 +198,7 @@ fn cover_img_length(configs: &config::Configs, picker: &ratatui_image::picker::P
 }
 
 fn construct_playback_text(
-    ui: &UIStateGuard,
+    ui: &Ctx<'_>,
     state: &SharedState,
     playable: &rspotify::model::PlayableItem,
     playback: &PlaybackMetadata,
@@ -240,13 +239,13 @@ fn construct_playback_text(
                     &configs.app_config.pause_icon
                 }
                 .to_owned(),
-                ui.theme.playback_status(),
+                ui.tui.theme.playback_status(),
             ),
             "{liked}" => match playable {
                 rspotify::model::PlayableItem::Track(track) => match &track.id {
                     Some(id) => {
                         if data.user_data.saved_tracks.contains_key(&id.uri()) {
-                            (configs.app_config.liked_icon.clone(), ui.theme.like())
+                            (configs.app_config.liked_icon.clone(), ui.tui.theme.like())
                         } else {
                             continue;
                         }
@@ -265,7 +264,7 @@ fn construct_playback_text(
                         );
                         display
                     },
-                    ui.theme.playback_track(),
+                    ui.tui.theme.playback_track(),
                 ),
                 rspotify::model::PlayableItem::Episode(episode) => (
                     {
@@ -276,7 +275,7 @@ fn construct_playback_text(
                             bidi_string
                         }
                     },
-                    ui.theme.playback_track(),
+                    ui.tui.theme.playback_track(),
                 ),
                 rspotify::model::PlayableItem::Unknown(_) => {
                     continue;
@@ -285,7 +284,7 @@ fn construct_playback_text(
             "{track_number}" => match playable {
                 rspotify::model::PlayableItem::Track(track) => (
                     { to_bidi_string(&track.track_number.to_string()) },
-                    ui.theme.playback_track(),
+                    ui.tui.theme.playback_track(),
                 ),
                 rspotify::model::PlayableItem::Episode(_)
                 | rspotify::model::PlayableItem::Unknown(_) => {
@@ -295,22 +294,24 @@ fn construct_playback_text(
             "{artists}" => match playable {
                 rspotify::model::PlayableItem::Track(track) => (
                     to_bidi_string(&crate::utils::map_join(&track.artists, |a| &a.name, ", ")),
-                    ui.theme.playback_artists(),
+                    ui.tui.theme.playback_artists(),
                 ),
-                rspotify::model::PlayableItem::Episode(episode) => {
-                    (episode.show.publisher.clone(), ui.theme.playback_artists())
-                }
+                rspotify::model::PlayableItem::Episode(episode) => (
+                    episode.show.publisher.clone(),
+                    ui.tui.theme.playback_artists(),
+                ),
                 rspotify::model::PlayableItem::Unknown(_) => {
                     continue;
                 }
             },
             "{album}" => match playable {
-                rspotify::model::PlayableItem::Track(track) => {
-                    (to_bidi_string(&track.album.name), ui.theme.playback_album())
-                }
+                rspotify::model::PlayableItem::Track(track) => (
+                    to_bidi_string(&track.album.name),
+                    ui.tui.theme.playback_album(),
+                ),
                 rspotify::model::PlayableItem::Episode(episode) => (
                     to_bidi_string(&episode.show.name),
-                    ui.theme.playback_album(),
+                    ui.tui.theme.playback_album(),
                 ),
                 rspotify::model::PlayableItem::Unknown(_) => {
                     continue;
@@ -322,10 +323,10 @@ fn construct_playback_text(
                         Some(genres) => &format_genres(genres, configs.app_config.genre_num),
                         None => "no genre",
                     };
-                    (to_bidi_string(genre), ui.theme.playback_genres())
+                    (to_bidi_string(genre), ui.tui.theme.playback_genres())
                 }
                 rspotify::model::PlayableItem::Episode(_) => {
-                    (to_bidi_string("no genre"), ui.theme.playback_genres())
+                    (to_bidi_string("no genre"), ui.tui.theme.playback_genres())
                 }
                 rspotify::model::PlayableItem::Unknown(_) => {
                     continue;
@@ -353,7 +354,7 @@ fn construct_playback_text(
                 }
 
                 let metadata_str = parts.join(" | ");
-                (metadata_str, ui.theme.playback_metadata())
+                (metadata_str, ui.tui.theme.playback_metadata())
             }
             _ => continue,
         };
@@ -372,7 +373,7 @@ fn construct_playback_text(
 
 fn render_playback_progress_bar(
     frame: &mut Frame,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     progress: chrono::Duration,
     duration: chrono::Duration,
     rect: Rect,
@@ -384,8 +385,8 @@ fn render_playback_progress_bar(
     match config::get_config().app_config.progress_bar_type {
         config::ProgressBarType::Line => frame.render_widget(
             LineGauge::default()
-                .filled_style(ui.theme.playback_progress_bar())
-                .unfilled_style(ui.theme.playback_progress_bar_unfilled())
+                .filled_style(ui.tui.theme.playback_progress_bar())
+                .unfilled_style(ui.tui.theme.playback_progress_bar_unfilled())
                 .ratio(ratio)
                 .label(Span::styled(
                     format!(
@@ -399,7 +400,7 @@ fn render_playback_progress_bar(
         ),
         config::ProgressBarType::Rectangle => frame.render_widget(
             Gauge::default()
-                .gauge_style(ui.theme.playback_progress_bar())
+                .gauge_style(ui.tui.theme.playback_progress_bar())
                 .ratio(ratio)
                 .label(Span::styled(
                     format!(
@@ -414,7 +415,11 @@ fn render_playback_progress_bar(
     }
 
     // update the progress bar's position stored inside the UI state
-    ui.playback_progress_bar_rect = rect;
+    ui.tui.playback_progress_bar_rect = ProgressBarLayout {
+        row: rect.y,
+        x: rect.x,
+        width: rect.width,
+    };
 }
 
 /// Split the given area into two, the first one for the playback window
@@ -434,7 +439,7 @@ fn split_rect_for_playback_window(state: &SharedState, rect: Rect) -> (Rect, Rec
     #[cfg(feature = "streaming")]
     let playback_width = playback_width
         + if configs.app_config.enable_audio_visualization && state.is_local_streaming_active() {
-            super::streaming::VIS_HEIGHT as usize
+            crate::visualization::VIS_HEIGHT as usize
         } else {
             0
         };

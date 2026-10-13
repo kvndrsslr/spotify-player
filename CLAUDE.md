@@ -8,34 +8,54 @@ This file guides Claude Code when working in this repository.
 
 ## Architecture
 
-### Key modules in `spotify_player/src/`
+The workspace has two crates: the **core** library and the **TUI binary**. Core owns the data
+model, state, playback, Spotify client, configuration (`app.toml`) and command execution, and
+must not depend on `ratatui`, `crossterm` or `ratatui-image`. The binary owns rendering, input
+mapping, terminal lifecycle, and the frontend configuration (`theme.toml`, `keymap.toml`).
+
+### Core crate — `crates/core/src/` (package `spotify_player_core`)
 
 | Module                        | Responsibility                                                              |
 | ----------------------------- | --------------------------------------------------------------------------- |
-| `main.rs`                     | Entry point; wires threads/tasks; CLI arg parsing; logging init             |
-| `state/`                      | Shared app state (`Arc<State>`): UI, player data, library caches, queue     |
+| `lib.rs`                      | Boundary documentation and the public module tree                           |
+| `state/`                      | Shared app state (`Arc<State>`): view model, player data, library caches, queue |
 | `state/model.rs`              | Core domain types: `Track`, `Album`, `Artist`, `Playlist`, `Playback`, etc. |
 | `state/player.rs`             | `PlayerState`: current playback, devices, queue, progress estimation        |
 | `state/data.rs`               | `AppData`: user library, TTL memory caches, file-cache persistence          |
-| `state/ui/`                   | `UIState`: page history stack, popup state, key buffer, count prefix        |
+| `state/view/`                 | `ViewState`: framework-agnostic page history, popups, cursors, text input   |
+| `controller.rs`               | Command executor: `Command`/`Action` → `ClientRequest` + view-state updates |
 | `client/mod.rs`               | `AppClient`: Spotify API calls, session management                          |
 | `client/request.rs`           | `ClientRequest` / `PlayerRequest` enums (async message types)               |
 | `client/handlers.rs`          | Tokio task: receives `ClientRequest`, dispatches API calls                  |
 | `client/rate_limit.rs`        | Web API request pacing and the client-wide rate-limit cooldown              |
-| `config/mod.rs`               | `Configs` loaded once into a `OnceLock`; read via `config::get_config()`    |
-| `config/keymap.rs`            | Default keybindings and key sequence lookup                                 |
-| `config/theme.rs`             | Theme definitions and style resolution                                      |
+| `config.rs`                   | `Configs` (app config + folders) loaded once; read via `config::get_config()` |
 | `command.rs`                  | `Command` enum (all TUI commands), `Action` / `CommandOrAction`             |
-| `key.rs`                      | `Key` / `KeySequence` types; vim-style key parsing (`C-x`, `M-x`)           |
-| `event/mod.rs`                | crossterm input loop; routes events to page or popup handler                |
-| `event/{page,popup}.rs`       | Key event dispatch per page / popup overlay                                 |
-| `ui/mod.rs`                   | ratatui render loop; main layout dispatch                                   |
-| `ui/{page,playback,popup}.rs` | Render functions for pages, playback bar, popups                            |
-| `ui/streaming.rs`             | FFT audio visualizer: `VisualizationSink`, `VisBands`, bar chart            |
+| `clipboard.rs`                | OS clipboard read/copy                                                      |
+| `visualization.rs`            | FFT audio bands (`VisBands`, `VisualizationSink`) shared with frontends     |
 | `streaming.rs`                | librespot connection + audio backend setup (feature-gated)                  |
-| `cli/`                        | Unix socket server and client for inter-process CLI commands                |
 | `auth.rs`                     | OAuth scopes and librespot credential/session building                      |
 | `media_control.rs`            | OS media key integration via `souvlaki` (feature-gated)                     |
+| `playlist_folders.rs`, `token.rs`, `log_layer.rs`, `utils.rs` | Playlist folder tree, token persistence, tracing layer, helpers |
+
+### TUI crate — `spotify_player/src/` (binary `spotify_player`)
+
+Core modules are re-exported at the binary root, so `crate::state::…`, `crate::client::…` and
+friends keep resolving; the frontend crate only adds the modules below.
+
+| Module                        | Responsibility                                                              |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| `main.rs`                     | Entry point; wires threads/tasks; CLI arg parsing; logging init             |
+| `frontend_config.rs`          | Frontend config store: theme + keymap, loaded from the core's config folder |
+| `theme.rs`, `keymap.rs`       | Theme definitions/style resolution and default keybindings                  |
+| `key.rs`                      | `Key` / `KeySequence` types; vim-style key parsing (`C-x`, `M-x`)           |
+| `event/mod.rs`                | crossterm input loop; routes events to page or popup handler                |
+| `event/{page,popup}.rs`       | Key event dispatch per page / popup overlay (defers to `controller.rs`)     |
+| `ui/mod.rs`                   | ratatui render loop; main layout dispatch                                   |
+| `ui/{page,playback,popup}.rs` | Render functions for pages, playback bar, popups                            |
+| `ui/state.rs`, `ui/ctx.rs`    | TUI-only state (theme, layout, image rendering) and its borrow context       |
+| `ui/streaming.rs`             | Audio visualizer bar chart                                                  |
+| `ui/image_compositor.rs`      | Cover-art encoding/transmission (`ratatui-image`, iTerm2 escapes)           |
+| `cli/`                        | Unix socket server and client for inter-process CLI commands                |
 
 ### Concurrency model
 
@@ -48,6 +68,9 @@ Multiple OS threads communicate via `flume` channels and `Arc<State>`:
 - **Media-control thread** — OS media key events (feature-gated)
 
 Event/UI threads never call async functions directly. They send a `ClientRequest` over a `flume` channel; the async handler updates `Arc<State>`.
+
+Frontends poll core state at their own cadence (`app_refresh_duration_in_ms`); there is no
+redraw notification. See `crates/core/src/lib.rs` for the full frontend contract.
 
 ### Feature flags
 
@@ -73,8 +96,15 @@ CI treats all warnings as errors. Before committing, run what CI runs:
 ```sh
 cargo fmt --all                      # CI checks: cargo fmt --all -- --check
 cargo test --no-default-features --features rodio-backend,media-control,image,notify,fzf
+cargo clippy --workspace --all-targets --no-default-features --features rodio-backend,media-control,image,notify,fzf -- -D warnings
 cargo clippy --no-default-features --features rodio-backend,media-control,image,notify,fzf -- -D warnings
 cargo clippy --no-default-features -- -D warnings   # core paths, no features
+```
+
+The core crate must stay frontend-free; verify with:
+
+```sh
+cargo tree -p spotify_player_core | grep -E 'ratatui|crossterm'   # must print nothing
 ```
 
 When fixing no-feature clippy warnings, you may need `#[allow(dead_code)]` / `#[allow(unused_variables)]` on items only used in feature-gated paths. If you touch `daemon`/`streaming` code, add `daemon` to the feature list above to lint those paths too.

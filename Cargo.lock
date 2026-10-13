@@ -5792,17 +5792,45 @@ name = "spotify_player"
 version = "0.24.1"
 dependencies = [
  "anyhow",
- "async-trait",
  "backtrace",
  "base64",
  "chrono",
  "chrono-humanize",
  "clap",
  "clap_complete",
- "clipboard-win",
- "config_parser2",
  "crossterm",
  "daemonize",
+ "flume",
+ "image",
+ "log",
+ "parking_lot",
+ "rand 0.10.2",
+ "ratatui",
+ "ratatui-image",
+ "regex",
+ "rspotify",
+ "rustls",
+ "serde",
+ "serde_json",
+ "spotify_player_core",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "vergen",
+ "winit",
+]
+
+[[package]]
+name = "spotify_player_core"
+version = "0.24.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clipboard-win",
+ "config_parser2",
  "dirs-next",
  "flume",
  "futures",
@@ -5819,13 +5847,10 @@ dependencies = [
  "open",
  "parking_lot",
  "rand 0.10.2",
- "ratatui",
- "ratatui-image",
  "regex",
  "reqwest 0.13.4",
  "rspotify",
  "rustfft",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5836,10 +5861,8 @@ dependencies = [
  "tracing-subscriber",
  "ttl_cache",
  "unicode-bidi",
- "vergen",
  "which 8.0.5",
  "windows 0.58.0",
- "winit",
 ]
 
 [[package]]

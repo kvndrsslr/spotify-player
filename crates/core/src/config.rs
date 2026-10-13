@@ -1,11 +1,14 @@
-mod keymap;
-mod theme;
-
 const DEFAULT_CONFIG_FOLDER: &str = ".config/spotify-player";
 const DEFAULT_CACHE_FOLDER: &str = ".cache/spotify-player";
 const APP_CONFIG_FILE: &str = "app.toml";
-const THEME_CONFIG_FILE: &str = "theme.toml";
-const KEYMAP_CONFIG_FILE: &str = "keymap.toml";
+/// Name of the theme configuration file inside the config folder.
+///
+/// Core does not interpret it; a frontend loads it itself.
+pub const THEME_CONFIG_FILE: &str = "theme.toml";
+/// Name of the keymap configuration file inside the config folder.
+///
+/// Core does not interpret it; a frontend loads it itself.
+pub const KEYMAP_CONFIG_FILE: &str = "keymap.toml";
 
 use anyhow::{anyhow, Result};
 use config_parser2::{config_parser_impl, ConfigParse, ConfigParser};
@@ -18,10 +21,6 @@ use std::{
 };
 
 use anyhow::Context;
-use keymap::KeymapConfig;
-use theme::ThemeConfig;
-
-pub use theme::Theme;
 
 use crate::auth::{NCSPOT_CLIENT_ID, SPOTIFY_CLIENT_ID};
 
@@ -30,8 +29,10 @@ static CONFIGS: OnceLock<Configs> = OnceLock::new();
 #[derive(Debug)]
 pub struct Configs {
     pub app_config: AppConfig,
-    pub keymap_config: KeymapConfig,
-    pub theme_config: ThemeConfig,
+    /// Folder holding the application's configuration files, including the frontend-owned
+    /// [`THEME_CONFIG_FILE`] and [`KEYMAP_CONFIG_FILE`].
+    pub config_folder: std::path::PathBuf,
+    /// Folder holding the application's cache, including fetched cover images.
     pub cache_folder: std::path::PathBuf,
 }
 
@@ -39,8 +40,7 @@ impl Configs {
     pub fn new(config_folder: &std::path::Path, cache_folder: &std::path::Path) -> Result<Self> {
         Ok(Self {
             app_config: AppConfig::new(config_folder)?,
-            keymap_config: KeymapConfig::new(config_folder)?,
-            theme_config: ThemeConfig::new(config_folder)?,
+            config_folder: config_folder.to_path_buf(),
             cache_folder: cache_folder.to_path_buf(),
         })
     }
@@ -528,6 +528,7 @@ impl AppConfig {
             })
     }
 
+    #[must_use]
     pub fn session_config(&self) -> SessionConfig {
         let proxy = self
             .proxy
@@ -573,9 +574,16 @@ pub fn get_cache_folder_path() -> Result<PathBuf> {
     }
 }
 
+/// # Panics
+///
+/// Panics if the configurations have not been set with [`set_config`] yet.
 pub fn get_config() -> &'static Configs {
     CONFIGS.get().expect("configs is already initialized")
 }
+
+/// # Panics
+///
+/// Panics if the configurations have already been set.
 pub fn set_config(configs: Configs) {
     CONFIGS
         .set(configs)

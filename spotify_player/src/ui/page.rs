@@ -9,14 +9,14 @@ use ratatui::{text::Line, widgets::Wrap};
 use crate::{state::Episode, state::Show, utils::format_duration};
 
 use super::{
-    config, utils, utils::construct_and_render_block, Album, Alignment, Artist, ArtistFocusState,
-    Borders, BrowsePageUIState, Cell, Constraint, Context, ContextPageUIState, DataReadGuard,
-    Frame, Id, Layout, LibraryFocusState, MutableWindowState, Orientation, PageState, Paragraph,
-    PlaylistFolderItem, Rect, Row, SearchFocusState, SharedState, ShowFocusState, Style, Table,
-    Text, Track, UIStateGuard,
+    config, single_line_input, utils, utils::construct_and_render_block, Album, Alignment, Artist,
+    ArtistFocusState, Borders, BrowsePageUIState, Cell, Constraint, Context, ContextPageUIState,
+    Ctx, DataReadGuard, Frame, Id, Layout, LibraryFocusState, MutableWindowState, Orientation,
+    PageState, Paragraph, PlaylistFolderItem, Rect, Row, SearchFocusState, SharedState,
+    ShowFocusState, Style, Table, Text, Track,
 };
 use crate::state::BidiDisplay;
-use crate::ui::utils::to_bidi_string;
+use crate::utils::to_bidi_string;
 
 const COMMAND_TABLE_CONSTRAINTS: [Constraint; 3] = [
     Constraint::Percentage(25),
@@ -35,7 +35,7 @@ pub fn render_search_page(
     is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) {
     fn search_items<T: Display>(items: &[T]) -> Vec<(String, bool)> {
@@ -60,7 +60,7 @@ pub fn render_search_page(
     let search_results = data.caches.search.get(current_query);
 
     // 2. Construct the page's layout
-    let rect = construct_and_render_block("Search", &ui.theme, Borders::ALL, frame, rect);
+    let rect = construct_and_render_block("Search", &ui.tui.theme, Borders::ALL, frame, rect);
 
     // search input's layout
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Fill(0)]).split(rect);
@@ -68,7 +68,7 @@ pub fn render_search_page(
     let rect = chunks[1];
 
     // track/album/artist/playlist/show/episode search results layout
-    let chunks = match ui.orientation {
+    let chunks = match ui.tui.orientation {
         // 1x6
         Orientation::Vertical => {
             let constraints = if focus_state == SearchFocusState::Input {
@@ -95,8 +95,8 @@ pub fn render_search_page(
 
     let track_rect = construct_and_render_block(
         "Tracks",
-        &ui.theme,
-        if ui.orientation == Orientation::Horizontal {
+        &ui.tui.theme,
+        if ui.tui.orientation == Orientation::Horizontal {
             Borders::TOP | Borders::RIGHT
         } else {
             Borders::TOP
@@ -105,11 +105,11 @@ pub fn render_search_page(
         chunks[0],
     );
     let album_rect =
-        construct_and_render_block("Albums", &ui.theme, Borders::TOP, frame, chunks[1]);
+        construct_and_render_block("Albums", &ui.tui.theme, Borders::TOP, frame, chunks[1]);
     let artist_rect = construct_and_render_block(
         "Artists",
-        &ui.theme,
-        if ui.orientation == Orientation::Horizontal {
+        &ui.tui.theme,
+        if ui.tui.orientation == Orientation::Horizontal {
             Borders::TOP | Borders::RIGHT
         } else {
             Borders::TOP
@@ -118,11 +118,11 @@ pub fn render_search_page(
         chunks[2],
     );
     let playlist_rect =
-        construct_and_render_block("Playlists", &ui.theme, Borders::TOP, frame, chunks[3]);
+        construct_and_render_block("Playlists", &ui.tui.theme, Borders::TOP, frame, chunks[3]);
     let show_rect = construct_and_render_block(
         "Shows",
-        &ui.theme,
-        if ui.orientation == Orientation::Horizontal {
+        &ui.tui.theme,
+        if ui.tui.orientation == Orientation::Horizontal {
             Borders::TOP | Borders::RIGHT
         } else {
             Borders::TOP
@@ -131,7 +131,7 @@ pub fn render_search_page(
         chunks[4],
     );
     let episode_rect =
-        construct_and_render_block("Episodes", &ui.theme, Borders::TOP, frame, chunks[5]);
+        construct_and_render_block("Episodes", &ui.tui.theme, Borders::TOP, frame, chunks[5]);
 
     // 3. Construct the page's widgets
     let (track_list, n_tracks) = {
@@ -146,7 +146,7 @@ pub fn render_search_page(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, track_items, is_active, selected_index)
+        utils::construct_list_widget(&ui.tui.theme, track_items, is_active, selected_index)
     };
 
     let (album_list, n_albums) = {
@@ -161,7 +161,7 @@ pub fn render_search_page(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, album_items, is_active, selected_index)
+        utils::construct_list_widget(&ui.tui.theme, album_items, is_active, selected_index)
     };
 
     let (artist_list, n_artists) = {
@@ -176,7 +176,7 @@ pub fn render_search_page(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, artist_items, is_active, selected_index)
+        utils::construct_list_widget(&ui.tui.theme, artist_items, is_active, selected_index)
     };
 
     let (playlist_list, n_playlists) = {
@@ -191,7 +191,7 @@ pub fn render_search_page(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, playlist_items, is_active, selected_index)
+        utils::construct_list_widget(&ui.tui.theme, playlist_items, is_active, selected_index)
     };
 
     let (show_list, n_shows) = {
@@ -205,7 +205,7 @@ pub fn render_search_page(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, show_items, is_active, selected_index)
+        utils::construct_list_widget(&ui.tui.theme, show_items, is_active, selected_index)
     };
 
     let (episode_list, n_episodes) = {
@@ -220,7 +220,7 @@ pub fn render_search_page(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, episode_items, is_active, selected_index)
+        utils::construct_list_widget(&ui.tui.theme, episode_items, is_active, selected_index)
     };
 
     // 4. Render the page's widgets
@@ -236,7 +236,10 @@ pub fn render_search_page(
 
     // Render the query input box
     frame.render_widget(
-        line_input.widget(is_active && focus_state == SearchFocusState::Input),
+        single_line_input::render(
+            line_input,
+            is_active && focus_state == SearchFocusState::Input,
+        ),
         search_input_rect,
     );
     utils::render_list_window(
@@ -287,7 +290,7 @@ pub fn render_context_page(
     is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) {
     // 1. Get data
@@ -328,7 +331,7 @@ pub fn render_context_page(
     // 2. Construct the page's title panel around the content area.
     let rect = construct_and_render_block(
         &context_page_type.title(),
-        &ui.theme,
+        &ui.tui.theme,
         Borders::ALL,
         frame,
         content_rect,
@@ -355,7 +358,7 @@ pub fn render_context_page(
             };
 
             frame.render_widget(
-                Paragraph::new(description).style(ui.theme.page_desc()),
+                Paragraph::new(description).style(ui.tui.theme.page_desc()),
                 chunks[0],
             );
             let rect = chunks[1];
@@ -384,7 +387,8 @@ pub fn render_context_page(
                         let chunks = Layout::vertical([Constraint::Length(1), Constraint::Fill(0)])
                             .split(rect);
                         frame.render_widget(
-                            Paragraph::new(playlist.desc.clone()).style(ui.theme.playlist_desc()),
+                            Paragraph::new(playlist.desc.clone())
+                                .style(ui.tui.theme.playlist_desc()),
                             chunks[0],
                         );
                         chunks[1]
@@ -434,7 +438,7 @@ pub fn render_context_page(
     if let (Some(footer_rect), Some(Context::Show { show, episodes, .. })) = (footer_rect, context)
     {
         let filtered = ui.search_filtered_items(episodes);
-        render_episode_detail_footer(frame, footer_rect, &data, ui, show, &filtered);
+        render_episode_detail_footer(frame, footer_rect, &data, ui, state, show, &filtered);
     }
 }
 
@@ -539,7 +543,7 @@ pub fn render_library_page(
     is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) {
     // 1. Get data
@@ -561,15 +565,19 @@ pub fn render_library_page(
     let (rects, grid_mode) = match library.layout {
         config::LibraryLayoutKind::Grid => match grid_library_rects(library, rect) {
             Some(r) => (r, true),
-            None => (stack_library_rects(ui.orientation, library, rect), false),
+            None => (
+                stack_library_rects(ui.tui.orientation, library, rect),
+                false,
+            ),
         },
-        config::LibraryLayoutKind::Stack => {
-            (stack_library_rects(ui.orientation, library, rect), false)
-        }
+        config::LibraryLayoutKind::Stack => (
+            stack_library_rects(ui.tui.orientation, library, rect),
+            false,
+        ),
     };
 
     // Quadrants get a full border; the stack keeps its historical shared-edge borders.
-    let orientation = ui.orientation;
+    let orientation = ui.tui.orientation;
     let border_for = move |idx: usize| -> Borders {
         if grid_mode {
             Borders::ALL
@@ -581,12 +589,13 @@ pub fn render_library_page(
     };
 
     let playlist_rect =
-        construct_and_render_block("Playlists", &ui.theme, border_for(0), frame, rects[0]);
+        construct_and_render_block("Playlists", &ui.tui.theme, border_for(0), frame, rects[0]);
     let album_rect =
-        construct_and_render_block("Albums", &ui.theme, border_for(1), frame, rects[1]);
+        construct_and_render_block("Albums", &ui.tui.theme, border_for(1), frame, rects[1]);
     let artist_rect =
-        construct_and_render_block("Artists", &ui.theme, border_for(2), frame, rects[2]);
-    let show_rect = construct_and_render_block("Shows", &ui.theme, border_for(3), frame, rects[3]);
+        construct_and_render_block("Artists", &ui.tui.theme, border_for(2), frame, rects[2]);
+    let show_rect =
+        construct_and_render_block("Shows", &ui.tui.theme, border_for(3), frame, rects[3]);
 
     // 3. Construct the page's widgets
     // Construct the playlist window
@@ -611,7 +620,7 @@ pub fn render_library_page(
         None
     };
     let (playlist_list, n_playlists) =
-        utils::construct_list_widget(&ui.theme, items, is_playlist_active, playlist_selected);
+        utils::construct_list_widget(&ui.tui.theme, items, is_playlist_active, playlist_selected);
     // Construct the saved album window
     let is_album_active = is_active && focus_state == LibraryFocusState::SavedAlbums;
     let album_selected = if is_album_active {
@@ -620,7 +629,7 @@ pub fn render_library_page(
         None
     };
     let (album_list, n_albums) = utils::construct_list_widget(
-        &ui.theme,
+        &ui.tui.theme,
         ui.search_filtered_items(&data.user_data.saved_albums)
             .into_iter()
             .map(|a| (a.to_bidi_string(), curr_context_uri == Some(a.id.uri())))
@@ -636,7 +645,7 @@ pub fn render_library_page(
         None
     };
     let (artist_list, n_artists) = utils::construct_list_widget(
-        &ui.theme,
+        &ui.tui.theme,
         ui.search_filtered_items(&data.user_data.followed_artists)
             .into_iter()
             .map(|a| (a.to_bidi_string(), curr_context_uri == Some(a.id.uri())))
@@ -652,7 +661,7 @@ pub fn render_library_page(
         None
     };
     let (show_list, n_shows) = utils::construct_list_widget(
-        &ui.theme,
+        &ui.tui.theme,
         ui.search_filtered_items(&data.user_data.saved_shows)
             .into_iter()
             .map(|s| (s.to_bidi_string(), curr_context_uri == Some(s.id.uri())))
@@ -702,7 +711,7 @@ pub fn render_browse_page(
     is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     mut rect: Rect,
 ) {
     // 1. Get data
@@ -717,11 +726,16 @@ pub fn render_browse_page(
     let (list, len) = match ui.current_page() {
         PageState::Browse { state: ui_state } => match ui_state {
             BrowsePageUIState::CategoryList { .. } => {
-                rect =
-                    construct_and_render_block("Categories", &ui.theme, Borders::ALL, frame, rect);
+                rect = construct_and_render_block(
+                    "Categories",
+                    &ui.tui.theme,
+                    Borders::ALL,
+                    frame,
+                    rect,
+                );
 
                 utils::construct_list_widget(
-                    &ui.theme,
+                    &ui.tui.theme,
                     ui.search_filtered_items(&data.browse.categories)
                         .into_iter()
                         .map(|c| (c.name.clone(), false))
@@ -732,7 +746,7 @@ pub fn render_browse_page(
             }
             BrowsePageUIState::CategoryPlaylistList { category, .. } => {
                 let title = format!("{} Playlists", category.name);
-                rect = construct_and_render_block(&title, &ui.theme, Borders::ALL, frame, rect);
+                rect = construct_and_render_block(&title, &ui.tui.theme, Borders::ALL, frame, rect);
 
                 let Some(playlists) = data.browse.category_playlists.get(&category.id) else {
                     frame.render_widget(Paragraph::new("Loading..."), rect);
@@ -740,7 +754,7 @@ pub fn render_browse_page(
                 };
 
                 utils::construct_list_widget(
-                    &ui.theme,
+                    &ui.tui.theme,
                     ui.search_filtered_items(playlists)
                         .into_iter()
                         .map(|c| (c.name.clone(), false))
@@ -765,14 +779,14 @@ pub fn render_lyrics_page(
     _is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     rect: Rect,
 ) {
     // 1. Get data
     let data = state.data.read();
 
     // 2. Construct the page's layout
-    let rect = construct_and_render_block("Lyrics", &ui.theme, Borders::ALL, frame, rect);
+    let rect = construct_and_render_block("Lyrics", &ui.tui.theme, Borders::ALL, frame, rect);
     let chunks = Layout::vertical([Constraint::Length(2), Constraint::Fill(0)]).split(rect);
 
     // 3. Construct the page's widgets
@@ -807,7 +821,7 @@ pub fn render_lyrics_page(
     let bidi_track = to_bidi_string(track);
     let bidi_artists = to_bidi_string(artists);
     frame.render_widget(
-        Paragraph::new(format!("{bidi_track} by {bidi_artists}")).style(ui.theme.page_desc()),
+        Paragraph::new(format!("{bidi_track} by {bidi_artists}")).style(ui.tui.theme.page_desc()),
         chunks[0],
     );
 
@@ -826,8 +840,8 @@ pub fn render_lyrics_page(
         .iter()
         .enumerate()
         .map(|(id, (_, line))| match (id + 1).cmp(&last_played_line_id) {
-            std::cmp::Ordering::Less => Line::styled(line, ui.theme.lyrics_played()),
-            std::cmp::Ordering::Equal => Line::styled(line, ui.theme.lyrics_playing()),
+            std::cmp::Ordering::Less => Line::styled(line, ui.tui.theme.lyrics_played()),
+            std::cmp::Ordering::Equal => Line::styled(line, ui.tui.theme.lyrics_playing()),
             std::cmp::Ordering::Greater => Line::raw(line),
         })
         .collect::<Vec<_>>();
@@ -842,11 +856,10 @@ pub fn render_lyrics_page(
     frame.render_widget(paragraph, chunks[1]);
 }
 
-pub fn render_commands_help_page(frame: &mut Frame, ui: &mut UIStateGuard, rect: Rect) {
+pub fn render_commands_help_page(frame: &mut Frame, ui: &mut Ctx<'_>, rect: Rect) {
     // 1. Get data
-    let configs = config::get_config();
     let mut map = BTreeMap::new();
-    let keymaps = ui.search_filtered_items(&configs.keymap_config.keymaps);
+    let keymaps = ui.search_filtered_items(&crate::frontend_config::get().keymap_config.keymaps);
     keymaps
         .into_iter()
         .filter(|km| km.include_in_help_screen())
@@ -876,7 +889,7 @@ pub fn render_commands_help_page(frame: &mut Frame, ui: &mut UIStateGuard, rect:
     };
 
     // 2. Construct the page's layout
-    let rect = construct_and_render_block("Commands", &ui.theme, Borders::ALL, frame, rect);
+    let rect = construct_and_render_block("Commands", &ui.tui.theme, Borders::ALL, frame, rect);
 
     // 3. Construct the page's widget
     let help_table = Table::new(
@@ -891,9 +904,9 @@ pub fn render_commands_help_page(frame: &mut Frame, ui: &mut UIStateGuard, rect:
                 ])
                 // adding alternating row colors
                 .style(if (i + scroll_offset) % 2 == 0 {
-                    ui.theme.secondary_row()
+                    ui.tui.theme.secondary_row()
                 } else {
-                    ui.theme.app()
+                    ui.tui.theme.app()
                 })
             })
             .collect::<Vec<_>>(),
@@ -905,19 +918,14 @@ pub fn render_commands_help_page(frame: &mut Frame, ui: &mut UIStateGuard, rect:
             Cell::from("Shortcuts"),
             Cell::from("Description"),
         ])
-        .style(ui.theme.table_header()),
+        .style(ui.tui.theme.table_header()),
     );
 
     // 4. Render the page's widget
     frame.render_widget(help_table, rect);
 }
 
-pub fn render_queue_page(
-    frame: &mut Frame,
-    state: &SharedState,
-    ui: &mut UIStateGuard,
-    rect: Rect,
-) {
+pub fn render_queue_page(frame: &mut Frame, state: &SharedState, ui: &mut Ctx<'_>, rect: Rect) {
     use rspotify::model::{FullEpisode, FullTrack, PlayableItem};
     fn get_playable_name(item: &PlayableItem) -> String {
         match item {
@@ -964,7 +972,7 @@ pub fn render_queue_page(
     };
 
     // 2. Construct the page's layout
-    let rect = construct_and_render_block("Queue", &ui.theme, Borders::ALL, frame, rect);
+    let rect = construct_and_render_block("Queue", &ui.tui.theme, Borders::ALL, frame, rect);
 
     // 3. Construct the page's widget
     let queue_table = Table::new(
@@ -995,7 +1003,7 @@ pub fn render_queue_page(
             Cell::from("Artists"),
             Cell::from("Duration"),
         ])
-        .style(ui.theme.table_header()),
+        .style(ui.tui.theme.table_header()),
     );
 
     // 4. Render page's widget
@@ -1011,7 +1019,7 @@ fn render_artist_context_page_windows(
     is_active: bool,
     frame: &mut Frame,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     data: &DataReadGuard,
     rect: Rect,
     artist_data: (&Artist, &[Track], &[Album], &[Artist]),
@@ -1048,19 +1056,19 @@ fn render_artist_context_page_windows(
     .split(rect);
     let top_tracks_rect = rows[0];
     let liked_songs_rect =
-        construct_and_render_block("Liked Songs", &ui.theme, Borders::TOP, frame, rows[1]);
+        construct_and_render_block("Liked Songs", &ui.tui.theme, Borders::TOP, frame, rows[1]);
 
     let bot_chunks = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(rows[2]);
     let albums_rect = construct_and_render_block(
         "Albums",
-        &ui.theme,
+        &ui.tui.theme,
         Borders::TOP | Borders::RIGHT,
         frame,
         bot_chunks[0],
     );
     let related_artists_rect = construct_and_render_block(
         "Related Artists",
-        &ui.theme,
+        &ui.tui.theme,
         Borders::TOP,
         frame,
         bot_chunks[1],
@@ -1096,10 +1104,10 @@ fn render_artist_context_page_windows(
             Cell::from("Type"),
             Cell::from("Name"),
         ])
-        .style(ui.theme.table_header()),
+        .style(ui.tui.theme.table_header()),
     )
     .column_spacing(2)
-    .row_highlight_style(ui.theme.selection(is_albums_active));
+    .row_highlight_style(ui.tui.theme.selection(is_albums_active));
 
     // artist list widget
     let (artist_list, n_artists) = {
@@ -1115,7 +1123,12 @@ fn render_artist_context_page_windows(
             None
         };
 
-        utils::construct_list_widget(&ui.theme, artist_items, is_artist_active, selected_index)
+        utils::construct_list_widget(
+            &ui.tui.theme,
+            artist_items,
+            is_artist_active,
+            selected_index,
+        )
     };
 
     // 4. Render the page's widgets
@@ -1171,7 +1184,7 @@ fn render_track_table(
     is_active: bool,
     state: &SharedState,
     tracks: Vec<&Track>,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     data: &DataReadGuard,
     is_artist_liked_songs: bool,
 ) {
@@ -1220,13 +1233,13 @@ fn render_track_table(
                 None => (id + 1).to_string(),
             };
             let (play_pause, style) = if playing_track_uri == t.id.uri() {
-                (playing_id.to_string(), ui.theme.current_playing())
+                (playing_id.to_string(), ui.tui.theme.current_playing())
             } else {
                 (String::new(), Style::default())
             };
             Row::new(vec![
                 if data.user_data.is_liked_track(t) {
-                    Cell::from(&configs.app_config.liked_icon as &str).style(ui.theme.like())
+                    Cell::from(&configs.app_config.liked_icon as &str).style(ui.tui.theme.like())
                 } else {
                     Cell::from("")
                 },
@@ -1299,10 +1312,10 @@ fn render_track_table(
             },
             Cell::from("Duration"),
         ])
-        .style(ui.theme.table_header()),
+        .style(ui.tui.theme.table_header()),
     )
     .column_spacing(2)
-    .row_highlight_style(ui.theme.selection(is_active));
+    .row_highlight_style(ui.tui.theme.selection(is_active));
 
     if let PageState::Context {
         state: Some(state), ..
@@ -1337,7 +1350,7 @@ fn render_episode_table(
     is_active: bool,
     state: &SharedState,
     episodes: Vec<&Episode>,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) {
     let configs = config::get_config();
     // get the current playing episode's URI to decorate such episode (if exists) in the episode table
@@ -1390,7 +1403,7 @@ fn render_episode_table(
                 None => (id + 1).to_string(),
             };
             let (id_str, style) = if playing_episode_uri == e.id.uri() {
-                (playing_id.to_string(), ui.theme.current_playing())
+                (playing_id.to_string(), ui.tui.theme.current_playing())
             } else {
                 (index_str, Style::default())
             };
@@ -1423,15 +1436,16 @@ fn render_episode_table(
             Cell::from("Date"),
             Cell::from("Duration"),
         ])
-        .style(ui.theme.table_header()),
+        .style(ui.tui.theme.table_header()),
     )
     .column_spacing(2)
     .row_highlight_style(if details_focused {
-        ui.theme
+        ui.tui
+            .theme
             .selection(true)
             .add_modifier(ratatui::style::Modifier::DIM)
     } else {
-        ui.theme.selection(is_active)
+        ui.tui.theme.selection(is_active)
     });
 
     if let PageState::Context {
@@ -1452,7 +1466,8 @@ fn render_episode_detail_footer(
     frame: &mut Frame,
     rect: Rect,
     data: &DataReadGuard,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
+    state: &SharedState,
     show: &Show,
     episodes: &[&Episode],
 ) {
@@ -1476,7 +1491,7 @@ fn render_episode_detail_footer(
         _ => return,
     };
 
-    let inner = construct_and_render_block("Description", &ui.theme, Borders::ALL, frame, rect);
+    let inner = construct_and_render_block("Description", &ui.tui.theme, Borders::ALL, frame, rect);
 
     // Episode cover art: prefer the episode's own image, falling back to the show's artwork
     // (one url per show, usually already cached by the playback panel) so the footer never
@@ -1493,18 +1508,17 @@ fn render_episode_detail_footer(
         let last = (selected + WINDOW_RADIUS).min(episodes.len().saturating_sub(1));
         let sig_first = episodes.first().map(|e| e.id.uri()).unwrap_or_default();
         let sig_last = episodes.last().map(|e| e.id.uri()).unwrap_or_default();
-        if ui.image_window_signature.as_ref() != Some(&(sig_first.clone(), sig_last.clone())) {
-            ui.image_window_signature = Some((sig_first, sig_last));
+        if state.update_image_window(sig_first, sig_last) {
             for ep in episodes.iter().take(last + 1).skip(first) {
                 if let Some(url) = ep.image_url.as_deref() {
-                    ui.queue_image_fetch(url);
+                    state.queue_image_fetch(url);
                 }
             }
         }
 
         if configs.app_config.layout.detail_window_image && inner.width > 2 && inner.height > 2 {
             let width = {
-                let font = ui.picker.font_size();
+                let font = ui.tui.picker.font_size();
                 inner.height.saturating_mul(font.height) / font.width.max(1)
             };
             let chunks = Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)])
@@ -1522,15 +1536,16 @@ fn render_episode_detail_footer(
                 .and_then(|url| data.caches.images.get(url).map(|img| (url, img)));
 
             if let Some((url, img)) = episode_img.or(show_img) {
-                let picker = ui.picker.clone();
-                ui.image_compositor
+                let picker = ui.tui.picker.clone();
+                ui.tui
+                    .image_compositor
                     .render(frame, &picker, "episode-detail", url, img, area);
             } else {
                 if let Some(url) = episode.image_url.as_deref() {
-                    ui.queue_image_fetch(url);
+                    state.queue_image_fetch(url);
                 }
                 if let Some(url) = show.image_url.as_deref() {
-                    ui.queue_image_fetch(url);
+                    state.queue_image_fetch(url);
                 }
             }
             chunks[1]
@@ -1545,9 +1560,9 @@ fn render_episode_detail_footer(
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(text_rect);
 
     let header_style = if is_focused {
-        ui.theme.selection(true)
+        ui.tui.theme.selection(true)
     } else {
-        ui.theme.playback_album()
+        ui.tui.theme.playback_album()
     };
     if !show.name.is_empty() {
         frame.render_widget(Paragraph::new(header).style(header_style), chunks[0]);
@@ -1579,8 +1594,8 @@ fn render_episode_detail_footer(
 
     frame.render_widget(paragraph.scroll((clamped, 0)), chunks[1]);
 }
-pub fn render_logs_page(frame: &mut Frame, state: &SharedState, ui: &mut UIStateGuard, rect: Rect) {
-    let rect = construct_and_render_block("Logs", &ui.theme, Borders::ALL, frame, rect);
+pub fn render_logs_page(frame: &mut Frame, state: &SharedState, ui: &mut Ctx<'_>, rect: Rect) {
+    let rect = construct_and_render_block("Logs", &ui.tui.theme, Borders::ALL, frame, rect);
 
     let logs = state.logs.lock();
     let scroll_offset = match ui.current_page_mut() {
