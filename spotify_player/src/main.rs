@@ -164,7 +164,11 @@ fn main() -> Result<()> {
             let log_buffer: Arc<Mutex<VecDeque<String>>> =
                 Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
 
-            runtime::init_logging(log_folder, log_buffer.clone())
+            // The frontend signal, built here because the logging layer (below) and the state
+            // (further down) share it: new log lines are new on-screen state for a log view.
+            let redraw = state::RedrawNotify::new();
+
+            runtime::init_logging(log_folder, log_buffer.clone(), redraw.clone())
                 .context("failed to initialize application's logging")?;
 
             // log the application's configurations
@@ -206,7 +210,7 @@ fn main() -> Result<()> {
                 )?)
             };
 
-            let state = std::sync::Arc::new(state::State::new(is_daemon, log_buffer));
+            let state = std::sync::Arc::new(state::State::new(is_daemon, log_buffer, redraw));
             start_app(&state, frontend)
         }
         Some((cmd, args)) => cli::handle_cli_subcommand(cmd, args),

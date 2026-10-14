@@ -1158,6 +1158,10 @@ impl AppClient {
                     state.queue_image_fetch(&url);
                 } else {
                     client.image_retries.lock().remove(&url);
+                    // The cover just entered the cache the render paths draw from. This is the
+                    // only way `caches.episode_images` grows outside the request handler, so the
+                    // signal has to be raised here and not only by the loop that drains the queue.
+                    state.redraw.raise();
                 }
             });
         }
@@ -1345,6 +1349,9 @@ impl AppClient {
             // reset the application's caches
             state.data.write().caches = MemoryCaches::new();
             self.initialize_playback(state, was_playing, remembered);
+            // A reconnect empties every cache and switches device, so every page has to be
+            // rebuilt; `initialize_playback` then refills the playback on its own schedule.
+            state.redraw.raise();
         }
 
         Ok(())
@@ -3674,12 +3681,22 @@ impl AppClient {
                             break;
                         }
                         offset += episodes.len();
-                        let mut data = state.data.write();
-                        if let Some(Context::Show {
-                            episodes: loaded, ..
-                        }) = data.caches.context.get_mut(&uri)
-                        {
-                            loaded.extend(episodes);
+                        let appended = {
+                            let mut data = state.data.write();
+                            match data.caches.context.get_mut(&uri) {
+                                Some(Context::Show {
+                                    episodes: loaded, ..
+                                }) => {
+                                    loaded.extend(episodes);
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if appended {
+                            // These pages land *after* `handle_request` returned, so nothing else
+                            // tells a frontend the episode table grew.
+                            state.redraw.raise();
                         }
                     }
                     Err(err) => {
@@ -4074,10 +4091,20 @@ impl AppClient {
             new_playback
         };
 
+        // `player.playback` was just replaced (whether or not the new track differs): this is the
+        // one place the Web API's playback state is written, from both the request handler and the
+        // background `update_playback` poll, so a frontend redraws from here rather than from
+        // every caller.
         if !new_playback {
+            state.redraw.raise();
             return Ok(());
         }
+
         self.handle_new_playback_event(state).await?;
+        // Raised after the new track's cover has been fetched and cached: raising before it would
+        // let the frame that paints the new track miss the cover and wait for the next one (the
+        // progress tick at best, the safety net at worst).
+        state.redraw.raise();
 
         Ok(())
     }

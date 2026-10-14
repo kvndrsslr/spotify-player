@@ -40,6 +40,9 @@ pub async fn start_client_handler(
                 if let Err(err) = client.handle_request(&state, request).await {
                     tracing::error!("Failed to handle client request: {err:#}");
                 }
+                // The single choke point for everything a request changes in the state a
+                // frontend draws: view, player and library data all land here.
+                state.redraw.raise();
             }
             .instrument(span),
         );
@@ -127,7 +130,8 @@ fn handle_page_change_event(
     state: &SharedState,
     client_pub: &flume::Sender<ClientRequest>,
     handler_state: &mut PlayerEventHandlerState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let mut changed = false;
     match state.view.lock().current_page_mut() {
         PageState::Context {
             id,
@@ -168,6 +172,7 @@ fn handle_page_change_event(
                 }
                 true
             };
+            changed = new_id;
 
             // request new context's data if not found in memory
             // To avoid making too many requests, only request if context id is changed
@@ -201,6 +206,7 @@ fn handle_page_change_event(
                         track.clone_from(&current_track.name);
                         *artists = map_join(&current_track.artists, |a| &a.name, ", ");
                         *track_uri = id.uri();
+                        changed = true;
                         client_pub.send(ClientRequest::GetLyrics {
                             track_id: id.clone_static(),
                         })?;
@@ -211,20 +217,20 @@ fn handle_page_change_event(
         _ => {}
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 fn handle_player_event(
     state: &SharedState,
     client_pub: &flume::Sender<ClientRequest>,
     handler_state: &mut PlayerEventHandlerState,
-) -> anyhow::Result<()> {
-    handle_page_change_event(state, client_pub, handler_state)
+) -> anyhow::Result<bool> {
+    let page_changed = handle_page_change_event(state, client_pub, handler_state)
         .context("handle page change event")?;
     handle_playback_change_event(state, client_pub, handler_state)
         .context("handle playback change event")?;
 
-    Ok(())
+    Ok(page_changed)
 }
 
 /// Starts event watcher listening to events and making update requests to the client if needed
@@ -251,8 +257,13 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
             handler_state.last_playback_refresh_timer = Instant::now();
         }
 
-        if let Err(err) = handle_player_event(state, client_pub, &mut handler_state) {
-            tracing::error!("Encounter error when handling player event: {err:#}");
+        match handle_player_event(state, client_pub, &mut handler_state) {
+            // The watcher's own writes are the page-change ones (a context page following
+            // playback, a lyrics page following the track). The requests it issues raise through
+            // the client task instead, so a pass that changed nothing stays silent.
+            Ok(true) => state.redraw.raise(),
+            Ok(false) => {}
+            Err(err) => tracing::error!("Encounter error when handling player event: {err:#}"),
         }
 
         std::thread::sleep(refresh_duration);

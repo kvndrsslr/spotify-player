@@ -374,6 +374,12 @@ starts directly, with no extra startup delay.
 
 **Notes**:
 
+- The TUI is event-driven: it redraws when something it draws has changed, not on a fixed tick, so
+  an idle application draws no frames at all (bar a 10 s safety net, the playing track's progress
+  clock, the startup spinner, and the cover-art compositor's own re-transmission deadlines).
+  `app_refresh_duration_in_ms` is the frame interval of the audio visualizer while it is shown and
+  audio plays; the TSP frontend still polls at that interval, because its session cannot be woken
+  from another thread.
 - `TERM_PROGRAM` does not survive `ssh`, so over `ssh` use `--frontend tsp` explicitly — the TSP
   handshake itself works there.
 - `--frontend tsp` fails when the build has no `tsp` feature or the terminal does not speak TSP,

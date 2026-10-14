@@ -3,6 +3,7 @@ mod data;
 mod model;
 mod player;
 mod queue;
+mod redraw;
 mod view;
 
 use std::{collections::VecDeque, sync::Arc};
@@ -13,6 +14,7 @@ pub use model::*;
 pub use player::*;
 #[allow(unused_imports)]
 pub use queue::*;
+pub use redraw::*;
 pub use view::*;
 
 use crate::config;
@@ -29,10 +31,17 @@ pub type SharedState = Arc<State>;
 /// player-event watcher, the media-control thread and a frontend's render loop run concurrently, so
 /// a reverse acquisition (a `data` guard taken under `player`, say) closes a cycle with the client
 /// task's writes and parks both threads.
+///
+/// [`State::redraw`] is not part of that order: it is a leaf, taken only inside
+/// [`RedrawNotify::raise`]/[`RedrawNotify::wait_timeout`] themselves, never around a state guard.
 pub struct State {
     pub view: Mutex<ViewState>,
     pub player: RwLock<PlayerState>,
     pub data: RwLock<AppData>,
+
+    /// The frontend-agnostic "something to draw changed" signal. See [`RedrawNotify`]: every path
+    /// that changes what a frontend draws raises it, and a frontend awaits it instead of polling.
+    pub redraw: RedrawNotify,
 
     /// The last locally commanded volume target. Volume events compute against this instead
     /// of the racy shared `buffered_playback`, so rapid events (scroll wheel) can't step on
@@ -68,13 +77,20 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(is_daemon: bool, log_buffer: Arc<Mutex<VecDeque<String>>>) -> Self {
+    /// `redraw` is the shared frontend signal; the logging layer holds a clone of it, so it is
+    /// built by the caller and passed to both.
+    pub fn new(
+        is_daemon: bool,
+        log_buffer: Arc<Mutex<VecDeque<String>>>,
+        redraw: RedrawNotify,
+    ) -> Self {
         let configs = config::get_config();
         let app_data = AppData::new(&configs.cache_folder);
 
         Self {
             view: Mutex::new(ViewState::default()),
             player: RwLock::new(PlayerState::default()),
+            redraw,
             volume_target: Mutex::new(None),
             #[cfg(feature = "image")]
             image_fetch_queue: Mutex::new(Vec::new()),

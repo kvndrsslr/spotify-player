@@ -87,6 +87,10 @@ pub struct AppConfig {
     pub ap_port: Option<u16>,
 
     // duration configs
+    /// Frame interval of the audio visualizer's frames while it is shown and audio plays. It is no
+    /// longer how often the application redraws: a frontend is reactive and draws when something
+    /// changed (see `state::RedrawNotify`), with its own fixed intervals for the views that move on
+    /// their own.
     pub app_refresh_duration_in_ms: u64,
     pub playback_refresh_duration_in_ms: u64,
 

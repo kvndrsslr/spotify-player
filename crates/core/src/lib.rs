@@ -53,13 +53,23 @@
 //!   `theme.toml` is loaded by the frontend from [`config::Configs::config_folder`].
 //! - [`state::State::queue_image_fetch`] — core drains this queue on a timer and refetches
 //!   cover art a frontend reported missing.
+//! - [`state::State::redraw`] — the redraw signal ([`state::RedrawNotify`]): every path that
+//!   changes what a frontend draws raises it, so a frontend awaits the next change instead of
+//!   polling. A frontend that cannot be woken from another thread may ignore it and poll.
 //!
-//! # Polling
+//! # Redraws
 //!
-//! There is no redraw notification: frontends poll [`state`] at their own cadence
-//! (`config::AppConfig::app_refresh_duration_in_ms`) and re-render when they choose.
+//! A frontend redraws when [`state::State::redraw`] says something changed. A few views move for
+//! reasons of their own rather than on a change — the audio visualizer interpolates from the time
+//! since the audio sink's last write and needs the configured frame interval
+//! (`AppConfig::app_refresh_duration_in_ms`), the playback clock advances in real time, the startup
+//! spinner animates, and the `image` compositor owes grid-anchored surfaces periodic
+//! re-transmissions — so a frontend also needs a deadline for those, and a bounded wait for the
+//! rest so a missed raise cannot freeze it.
+//!
 //! Shutdown is cooperative through [`state::ViewState::is_running`], which the executor
-//! clears for [`command::Command::Quit`].
+//! clears for [`command::Command::Quit`]; every path clearing it raises the signal, so a waiting
+//! frontend wakes and can exit.
 
 pub mod auth;
 pub mod client;

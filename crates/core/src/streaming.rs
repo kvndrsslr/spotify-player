@@ -325,6 +325,11 @@ pub async fn new_connection(
                         }
                         client.update_playback(&state);
 
+                        // The local player's own truth — `streaming_track_id`, the buffered
+                        // play/pause state and whether the visualizer bands are live — changed
+                        // just now; only `update_playback`'s later poll would otherwise say so.
+                        state.redraw.raise();
+
                         // execute a player event hook command
                         if let Some(ref cmd) = configs.app_config.player_event_hook_command {
                             if let Err(err) = execute_player_event_hook_command(cmd, &event) {

@@ -70,7 +70,8 @@ friends keep resolving; the frontend crate only adds the modules below.
 Multiple OS threads communicate via `flume` channels and `Arc<State>`:
 
 - **Event thread** — blocking `crossterm::event::read()` loop (spawned by `frontend/tui.rs`)
-- **UI thread** — poll-based ratatui render loop (spawned by `frontend/tui.rs`)
+- **UI thread** — event-driven ratatui render loop: it redraws on a `state::RedrawNotify` raise or a
+  few self-moving views' deadlines, and blocks otherwise (spawned by `frontend/tui.rs`)
 - **Tokio runtime** — async tasks: client handler, session watcher, socket listener, streaming
   (client handler + session watcher + cover-image recovery + the player-event watcher thread are
   spawned by `crates/core/src/runtime.rs`; the socket listener by the frontend)
@@ -79,8 +80,11 @@ Multiple OS threads communicate via `flume` channels and `Arc<State>`:
 
 Event/UI threads never call async functions directly. They send a `ClientRequest` over a `flume` channel; the async handler updates `Arc<State>`.
 
-Frontends poll core state at their own cadence (`app_refresh_duration_in_ms`); there is no
-redraw notification. See `crates/core/src/lib.rs` for the full frontend contract.
+Frontends redraw on `state::RedrawNotify` instead of polling: every path that changes what a
+frontend draws raises it. `app_refresh_duration_in_ms` is only the audio visualizer's frame
+interval (plus the TSP frontend's poll); the TUI's own idle timers are fixed (progress clock,
+startup spinner, a 10 s safety net).
+See `crates/core/src/lib.rs` for the full frontend contract.
 
 ### Feature flags
 

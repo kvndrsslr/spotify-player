@@ -4,14 +4,25 @@ use parking_lot::Mutex;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 
+use crate::state::RedrawNotify;
+
 pub struct BufferLayer {
     buffer: Arc<Mutex<VecDeque<String>>>,
     max_lines: usize,
+    redraw: RedrawNotify,
 }
 
 impl BufferLayer {
-    pub fn new(buffer: Arc<Mutex<VecDeque<String>>>, max_lines: usize) -> Self {
-        Self { buffer, max_lines }
+    pub fn new(
+        buffer: Arc<Mutex<VecDeque<String>>>,
+        max_lines: usize,
+        redraw: RedrawNotify,
+    ) -> Self {
+        Self {
+            buffer,
+            max_lines,
+            redraw,
+        }
     }
 }
 
@@ -39,6 +50,12 @@ impl<S: Subscriber> Layer<S> for BufferLayer {
         while buf.len() > self.max_lines {
             buf.pop_front();
         }
+        drop(buf);
+
+        // The log view renders straight from this buffer, so a new line is new on-screen state.
+        // Suppressed while this thread is inside a frame (a render path that logs must not
+        // schedule the next frame) -- see `RedrawNotify::frame`.
+        self.redraw.raise();
     }
 }
 
