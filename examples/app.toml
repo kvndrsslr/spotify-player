@@ -9,9 +9,9 @@ playback_metadata_fields = ["repeat", "shuffle", "volume", "device"]
 notify_format = { summary = "{track} • {artists}", body = "{album}" }
 notify_timeout_in_secs = 0
 notify_transient = false
-# Frame interval for the views that move on their own: the audio visualizer, the startup
-# "Loading..." spinner and the TSP frontend's poll. The TUI is otherwise reactive: it redraws
-# when something changes, not on a fixed tick.
+# Frame interval for the audio visualizer (while it is shown and audio plays) and for the TSP
+# frontend's poll. The TUI is otherwise reactive: it redraws when something changes, and while
+# idle it only draws the playing track's progress clock, the startup spinner and a 10s safety net.
 app_refresh_duration_in_ms = 32
 playback_refresh_duration_in_ms = 0
 page_size_in_rows = 20

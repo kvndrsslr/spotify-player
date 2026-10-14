@@ -81,8 +81,9 @@ Multiple OS threads communicate via `flume` channels and `Arc<State>`:
 Event/UI threads never call async functions directly. They send a `ClientRequest` over a `flume` channel; the async handler updates `Arc<State>`.
 
 Frontends redraw on `state::RedrawNotify` instead of polling: every path that changes what a
-frontend draws raises it, and `app_refresh_duration_in_ms` is only the frame interval of the views
-that move on their own (the audio visualizer, the startup spinner) plus the TSP frontend's poll.
+frontend draws raises it. `app_refresh_duration_in_ms` is only the audio visualizer's frame
+interval (plus the TSP frontend's poll); the TUI's own idle timers are fixed (progress clock,
+startup spinner, a 10 s safety net).
 See `crates/core/src/lib.rs` for the full frontend contract.
 
 ### Feature flags

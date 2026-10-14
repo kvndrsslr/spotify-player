@@ -48,8 +48,20 @@ const MAX_IDLE_WAIT: Duration = Duration::from_secs(10);
 
 /// Elapsed-time refresh while a track plays: the progress bar, the lyrics highlight and the
 /// playback clock are computed from a stored position plus wall-clock time, so they need a tick
-/// even when nothing changes state.
-const PLAYBACK_REFRESH: Duration = Duration::from_secs(1);
+/// even when nothing changes state. At ~4 frames/s the bar fills smoothly for far less than the
+/// fixed-rate loop this replaced cost.
+const PROGRESS_REFRESH: Duration = Duration::from_millis(250);
+
+/// Floor on how often a *change* may drive a frame.
+///
+/// A raise storm (a chatty log target, a scripted CLI client, a burst of input) would otherwise
+/// draw once per raise: measured at ~104 raises/s it drove 104 frames/s and 11% of a core, worse
+/// than the fixed-rate loop this replaced. The floor is fixed rather than derived from
+/// `app_refresh_duration_in_ms`, and it applies to change-driven frames only — a timer (the
+/// visualizer, the progress clock, the compositor) is never clamped by it, so configuring an
+/// interval below the floor still gets that cadence for the views that need it while a change
+/// still waits its turn.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Refresh while the first playback fetch is still outstanding, matching the 100ms step the
 /// "Loading..." spinner's glyphs advance on.
@@ -70,12 +82,17 @@ pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal
 
     let mut periodic = PeriodicRefresh::default();
     let mut retry_at = Instant::now();
+    let mut next_frame_at = Instant::now();
+    let min_frame_interval = MIN_FRAME_INTERVAL;
+    // Set when a change asked for a frame inside the floor: the frame is owed at the floor rather
+    // than dropped.
+    let mut owed = false;
 
     loop {
         let now = Instant::now();
 
-        // Draw immediately when the last draw failed and its backoff has run out; otherwise wait
-        // for a raise or the earliest deadline this frame owes.
+        // The earliest a *timer* is due (or the safety net, or a failed draw's backoff). A timer is
+        // never clamped by the floor below, so the visualizer keeps its configured cadence.
         let deadline = if now < retry_at {
             retry_at
         } else {
@@ -88,16 +105,26 @@ pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal
             }
             deadline
         };
+        // When a change-driven frame may be drawn, and the floor on every path while a draw is
+        // failing. Only a *pending* change waits for it: blocking on the floor with nothing owed
+        // would delay the safety net, and clamping the timers with it would slow the visualizer.
+        let floor = next_frame_at.max(retry_at);
+        let wait_until = if owed { deadline.min(floor) } else { deadline };
 
         let signalled = state
             .redraw
-            .wait_timeout(deadline.saturating_duration_since(now));
-        if !signalled && Instant::now() < deadline {
-            // Nothing changed and no deadline is due yet: keep waiting.
-            continue;
-        }
+            .wait_timeout(wait_until.saturating_duration_since(now));
 
         let drawn_at = Instant::now();
+        let timer_due = drawn_at >= deadline;
+        if !(timer_due || signalled && drawn_at >= floor) {
+            // Either a raise inside the floor (defer it to the floor) or — unreachable, since
+            // `wait_while_for` waits out its deadline — a spurious early return.
+            owed = signalled && drawn_at < floor;
+            continue;
+        }
+        owed = false;
+
         // Ignore raises from this thread's own render path: a draw that logs must be retried on
         // the policy below, not on the log line it just wrote.
         let frame = state.redraw.frame();
@@ -131,6 +158,7 @@ pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal
         match result {
             Ok(_) => {
                 periodic.serviced(drawn_at);
+                next_frame_at = drawn_at + min_frame_interval;
                 retry_at = drawn_at;
             }
             Err(err) => {
@@ -150,7 +178,7 @@ pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal
 #[derive(Default)]
 struct PeriodicRefresh {
     visualizer: Option<Instant>,
-    playback: Option<Instant>,
+    progress: Option<Instant>,
     spinner: Option<Instant>,
 }
 
@@ -187,7 +215,7 @@ impl PeriodicRefresh {
                 player.playback_last_updated_time.is_none(),
             )
         };
-        arm(&mut self.playback, playing, PLAYBACK_REFRESH);
+        arm(&mut self.progress, playing, PROGRESS_REFRESH);
         arm(&mut self.spinner, awaiting_first_playback, SPINNER_REFRESH);
 
         earliest
@@ -195,7 +223,7 @@ impl PeriodicRefresh {
 
     /// Record a frame drawn at `now`, moving every running timer on.
     fn serviced(&mut self, now: Instant) {
-        for timer in [&mut self.visualizer, &mut self.playback, &mut self.spinner] {
+        for timer in [&mut self.visualizer, &mut self.progress, &mut self.spinner] {
             if timer.is_some() {
                 *timer = Some(now);
             }

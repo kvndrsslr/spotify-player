@@ -44,7 +44,7 @@ impl RedrawNotify {
     /// own render path emitting a log line must not schedule the frame after it, and a draw that
     /// keeps failing must be retried on the retry policy, not on its own error output.
     pub fn raise(&self) {
-        if IN_FRAME.with(Cell::get) {
+        if FRAME_DEPTH.with(Cell::get) > 0 {
             return;
         }
         *self.inner.changed.lock() = true;
@@ -66,27 +66,28 @@ impl RedrawNotify {
 
     /// Mark this thread as drawing a frame until the returned guard drops.
     ///
-    /// Per-thread on purpose: a raise from any *other* thread while a frame draws is a real
-    /// change and still schedules the next frame.
+    /// Re-entrant: each guard counts one level of nesting, and the thread counts as drawing until
+    /// the outermost one drops. Per-thread on purpose: a raise from any *other* thread while a
+    /// frame draws is a real change and still schedules the next frame.
     #[must_use]
     pub fn frame(&self) -> FrameGuard {
-        IN_FRAME.with(|in_frame| in_frame.set(true));
+        FRAME_DEPTH.with(|depth| depth.set(depth.get() + 1));
         FrameGuard
     }
 }
 
-/// Clears the drawing flag on drop. See [`RedrawNotify::frame`].
+/// Clears one level of the drawing flag on drop. See [`RedrawNotify::frame`].
 pub struct FrameGuard;
 
 impl Drop for FrameGuard {
     fn drop(&mut self) {
-        IN_FRAME.with(|in_frame| in_frame.set(false));
+        FRAME_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 
 thread_local! {
-    /// Whether the current thread is inside a frame. See [`RedrawNotify::frame`].
-    static IN_FRAME: Cell<bool> = const { Cell::new(false) };
+    /// How many frames deep the current thread is. See [`RedrawNotify::frame`].
+    static FRAME_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(test)]

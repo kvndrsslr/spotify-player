@@ -61,10 +61,11 @@
 //!
 //! A frontend redraws when [`state::State::redraw`] says something changed. A few views move for
 //! reasons of their own rather than on a change — the audio visualizer interpolates from the time
-//! since the audio sink's last write, the playback clock advances in real time, the startup
+//! since the audio sink's last write and needs the configured frame interval
+//! (`AppConfig::app_refresh_duration_in_ms`), the playback clock advances in real time, the startup
 //! spinner animates, and the `image` compositor owes grid-anchored surfaces periodic
-//! re-transmissions — so a frontend also needs a deadline for those. `AppConfig::app_refresh_duration_in_ms`
-//! is that frame interval, no longer the redraw cadence.
+//! re-transmissions — so a frontend also needs a deadline for those, and a bounded wait for the
+//! rest so a missed raise cannot freeze it.
 //!
 //! Shutdown is cooperative through [`state::ViewState::is_running`], which the executor
 //! clears for [`command::Command::Quit`]; every path clearing it raises the signal, so a waiting

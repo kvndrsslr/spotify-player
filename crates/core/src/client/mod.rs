@@ -2453,12 +2453,22 @@ impl AppClient {
                             break;
                         }
                         offset += episodes.len();
-                        let mut data = state.data.write();
-                        if let Some(Context::Show {
-                            episodes: loaded, ..
-                        }) = data.caches.context.get_mut(&uri)
-                        {
-                            loaded.extend(episodes);
+                        let appended = {
+                            let mut data = state.data.write();
+                            match data.caches.context.get_mut(&uri) {
+                                Some(Context::Show {
+                                    episodes: loaded, ..
+                                }) => {
+                                    loaded.extend(episodes);
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if appended {
+                            // These pages land *after* `handle_request` returned, so nothing else
+                            // tells a frontend the episode table grew.
+                            state.redraw.raise();
                         }
                     }
                     Err(err) => {
@@ -2859,12 +2869,16 @@ impl AppClient {
         // one place the Web API's playback state is written, from both the request handler and the
         // background `update_playback` poll, so a frontend redraws from here rather than from
         // every caller.
-        state.redraw.raise();
-
         if !new_playback {
+            state.redraw.raise();
             return Ok(());
         }
+
         self.handle_new_playback_event(state).await?;
+        // Raised after the new track's cover has been fetched and cached: raising before it would
+        // let the frame that paints the new track miss the cover and wait for the next one (the
+        // progress tick at best, the safety net at worst).
+        state.redraw.raise();
 
         Ok(())
     }
