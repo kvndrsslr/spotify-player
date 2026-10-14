@@ -9,9 +9,10 @@ This file guides Claude Code when working in this repository.
 ## Architecture
 
 The workspace has two crates: the **core** library and the **TUI binary**. Core owns the data
-model, state, playback, Spotify client, configuration (`app.toml`) and command execution, and
-must not depend on `ratatui`, `crossterm` or `ratatui-image`. The binary owns rendering, input
-mapping, terminal lifecycle, and the frontend configuration (`theme.toml`, `keymap.toml`).
+model, state, playback, Spotify client, configuration (`app.toml`), the key vocabulary and the
+user's keybindings (`keymap.toml`), command execution, and must not depend on `ratatui`,
+`crossterm` or `ratatui-image`. The binary owns rendering, terminal lifecycle, reading the
+terminal's events, and the frontend theme configuration (`theme.toml`).
 
 ### Core crate — `crates/core/src/` (package `spotify_player_core`)
 
@@ -28,8 +29,12 @@ mapping, terminal lifecycle, and the frontend configuration (`theme.toml`, `keym
 | `client/request.rs`           | `ClientRequest` / `PlayerRequest` enums (async message types)               |
 | `client/handlers.rs`          | Tokio task: receives `ClientRequest`, dispatches API calls                  |
 | `client/rate_limit.rs`        | Web API request pacing and the client-wide rate-limit cooldown              |
-| `config.rs`                   | `Configs` (app config + folders) loaded once; read via `config::get_config()` |
+| `config.rs`                   | `Configs` (app config + keybindings + folders) loaded once; read via `config::get_config()` |
+| `key.rs`                      | Framework-agnostic `Key` / `KeyCode` / `KeySequence`; vim-style key parsing (`C-x`, `M-x`)  |
+| `keymap.rs`                   | `KeymapConfig`: default keybindings, `keymap.toml` merging, key-sequence → command lookup   |
 | `command.rs`                  | `Command` enum (all TUI commands), `Action` / `CommandOrAction`             |
+| `playback.rs`                 | `playback_format` → `PlaybackSpan`/`PlaybackToken` (the playback bar's text) |
+| `runtime.rs`                  | Frontend-agnostic startup: `init_logging`, `start` (client + background tasks) |
 | `clipboard.rs`                | OS clipboard read/copy                                                      |
 | `visualization.rs`            | FFT audio bands (`VisBands`, `VisualizationSink`) shared with frontends     |
 | `streaming.rs`                | librespot connection + audio backend setup (feature-gated)                  |
@@ -44,12 +49,15 @@ friends keep resolving; the frontend crate only adds the modules below.
 
 | Module                        | Responsibility                                                              |
 | ----------------------------- | --------------------------------------------------------------------------- |
-| `main.rs`                     | Entry point; wires threads/tasks; CLI arg parsing; logging init             |
-| `frontend_config.rs`          | Frontend config store: theme + keymap, loaded from the core's config folder |
-| `theme.rs`, `keymap.rs`       | Theme definitions/style resolution and default keybindings                  |
-| `key.rs`                      | `Key` / `KeySequence` types; vim-style key parsing (`C-x`, `M-x`)           |
-| `event/mod.rs`                | crossterm input loop; routes events to page or popup handler                |
+| `main.rs`                     | CLI arg parsing, config/daemon init, `runtime::start`, frontend selection, the CLI socket task, the keep-alive/winit block |
+| `frontend/mod.rs`             | Frontend selection (`--frontend` / `app.toml`'s `frontend`) and the `Frontend` table          |
+| `frontend/tui.rs`             | The ratatui TUI frontend: terminal setup + its event and UI threads                          |
+| `frontend/tsp/`               | The Tern Surface Protocol frontend (`tsp` feature): session loop, keys, document, blobs, palette |
+| `frontend_config.rs`          | Frontend config store: the theme, loaded from the core's config folder      |
+| `theme.rs`                    | Theme definitions and their ratatui style resolution                        |
+| `event/mod.rs`                | crossterm input loop; converts key events to core `key::Key`; routes events to page or popup handler |
 | `event/{page,popup}.rs`       | Key event dispatch per page / popup overlay (defers to `controller.rs`)     |
+| `event/dispatch.rs`           | The key → command → handler pipeline both frontends share                   |
 | `ui/mod.rs`                   | ratatui render loop; main layout dispatch                                   |
 | `ui/{page,playback,popup}.rs` | Render functions for pages, playback bar, popups                            |
 | `ui/state.rs`, `ui/ctx.rs`    | TUI-only state (theme, layout, image rendering) and its borrow context       |
@@ -61,9 +69,11 @@ friends keep resolving; the frontend crate only adds the modules below.
 
 Multiple OS threads communicate via `flume` channels and `Arc<State>`:
 
-- **Event thread** — blocking `crossterm::event::read()` loop
-- **UI thread** — poll-based ratatui render loop
-- **Tokio runtime** — async tasks: client handler, socket listener, streaming
+- **Event thread** — blocking `crossterm::event::read()` loop (spawned by `frontend/tui.rs`)
+- **UI thread** — poll-based ratatui render loop (spawned by `frontend/tui.rs`)
+- **Tokio runtime** — async tasks: client handler, session watcher, socket listener, streaming
+  (client handler + session watcher + cover-image recovery + the player-event watcher thread are
+  spawned by `crates/core/src/runtime.rs`; the socket listener by the frontend)
 - **Player-event watcher** — polls librespot playback state, sends `ClientRequest`s
 - **Media-control thread** — OS media key events (feature-gated)
 
@@ -86,8 +96,9 @@ redraw notification. See `crates/core/src/lib.rs` for the full frontend contract
 | `notify`                                                                                                                                | Desktop notifications                                    |
 | `daemon`                                                                                                                                | Daemonize mode (implies `streaming`)                     |
 | `fzf`                                                                                                                                   | Fuzzy search                                             |
+| `tsp`                                                                                                                                   | Tern Surface Protocol frontend (`dep:tern-sdk`)           |
 
-Default: `rodio-backend` + `media-control`. Gate feature-specific code with `#[cfg(feature = "...")]`.
+Default: `rodio-backend` + `media-control` + `tsp`. Gate feature-specific code with `#[cfg(feature = "...")]`.
 
 ## Verifying changes
 
@@ -95,11 +106,16 @@ CI treats all warnings as errors. Before committing, run what CI runs:
 
 ```sh
 cargo fmt --all                      # CI checks: cargo fmt --all -- --check
-cargo test --no-default-features --features rodio-backend,media-control,image,notify,fzf
-cargo clippy --workspace --all-targets --no-default-features --features rodio-backend,media-control,image,notify,fzf -- -D warnings
-cargo clippy --no-default-features --features rodio-backend,media-control,image,notify,fzf -- -D warnings
+cargo test --no-default-features --features rodio-backend,media-control,image,notify,fzf,tsp
+cargo clippy --workspace --all-targets --no-default-features --features rodio-backend,media-control,image,notify,fzf,tsp -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features rodio-backend,media-control,tsp -- -D warnings   # tsp without image
+cargo clippy --no-default-features --features rodio-backend,media-control,image,notify,fzf,tsp -- -D warnings
 cargo clippy --no-default-features -- -D warnings   # core paths, no features
 ```
+
+The tests above run the TSP frontend against an in-memory terminal. To prove it against a real
+Tern — a headless pane, injected keys and clicks, the wire recording — see
+[docs/tsp-testing.md](docs/tsp-testing.md).
 
 The core crate must stay frontend-free; verify with:
 
@@ -153,7 +169,7 @@ Keep `.github/copilot-instructions.md` and this `CLAUDE.md` in sync when project
 ### Adding a new `Command`
 
 1. Add the variant to `Command` in `command.rs` and update `Command::desc()`.
-2. Add a default keybinding in `config/keymap.rs`.
+2. Add a default keybinding in `crates/core/src/keymap.rs`.
 3. Update the command table in `README.md`.
 
 ## Writing PR descriptions

@@ -3,8 +3,8 @@ use crate::{
     state::{
         Album, Artist, ArtistFocusState, BrowsePageUIState, Context, ContextPageUIState, Cursor,
         DataReadGuard, Id, LibraryFocusState, MutableWindowState, PageState, PageType,
-        PlaybackMetadata, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistPopupAction,
-        PopupState, SearchFocusState, SharedState, ShowFocusState, Track,
+        PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistPopupAction, PopupState,
+        SearchFocusState, SharedState, ShowFocusState, Track,
     },
 };
 

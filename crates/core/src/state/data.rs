@@ -7,6 +7,15 @@ use std::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::LazyLock;
 
+#[cfg(feature = "image")]
+use std::{fmt::Write as _, io::Cursor, sync::Arc};
+
+#[cfg(feature = "image")]
+use anyhow::Context as _;
+
+#[cfg(feature = "image")]
+use sha2::{Digest as _, Sha256};
+
 use super::model::{
     Album, Artist, Category, Context, ContextId, Id, Playlist, PlaylistFolderItem,
     PlaylistFolderNode, SearchResults, Show, Track,
@@ -65,6 +74,44 @@ pub struct MemoryCaches {
     /// item always one that is far from the pointer. Cap >> window radius.
     #[cfg(feature = "image")]
     pub episode_images: EpisodeImageRing,
+}
+
+/// Encoded cover-image bytes with their content id.
+///
+/// The id is the lowercase hex SHA-256 of [`Self::data`], the same rule a content-addressed
+/// receiver (Tern's `b` blob) uses, so a frontend can name the bytes by their hash.
+#[cfg(feature = "image")]
+#[derive(Clone)]
+pub struct ImageBlob {
+    /// Lowercase hex SHA-256 of [`Self::data`].
+    pub id: String,
+    /// The MIME type of [`Self::data`].
+    pub mime: &'static str,
+    /// The PNG-encoded bytes; shared so a re-render does not re-encode or copy them.
+    pub data: Arc<Vec<u8>>,
+}
+
+#[cfg(feature = "image")]
+impl ImageBlob {
+    /// PNG-encodes `image` and hashes the encoded bytes.
+    pub(crate) fn encode(image: &image::DynamicImage) -> anyhow::Result<Self> {
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .context("encode cover image to PNG")?;
+
+        let digest = Sha256::digest(&png);
+        let mut id = String::with_capacity(64);
+        for byte in digest {
+            let _ = write!(id, "{byte:02x}");
+        }
+
+        Ok(Self {
+            id,
+            mime: "image/png",
+            data: Arc::new(png),
+        })
+    }
 }
 
 /// Fixed-capacity LRU keyed by image url, storing small decoded covers.
@@ -373,6 +420,40 @@ pub fn load_context_from_file_cache(cache_folder: &Path, uri: &str) -> Option<Ca
 mod tests {
     use super::*;
     use crate::state::model::{AlbumId, ArtistId, PlaylistId, TrackId, UserId};
+
+    /// The blob id is the lowercase hex SHA-256 of exactly the bytes that are sent.
+    #[cfg(feature = "image")]
+    #[test]
+    fn image_blob_id_is_the_sha256_of_the_png_bytes() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2,
+            3,
+            image::Rgb([255, 0, 0]),
+        ));
+
+        let blob = ImageBlob::encode(&image).expect("encodes");
+        let bytes = &blob.data[..];
+
+        assert_eq!(blob.mime, "image/png");
+        assert_eq!(blob.id.len(), 64, "a SHA-256 in hex");
+        assert!(
+            blob.id
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "lowercase hex: {}",
+            blob.id
+        );
+
+        let digest = Sha256::digest(bytes);
+        let mut expected = String::with_capacity(64);
+        for byte in digest {
+            let _ = write!(expected, "{byte:02x}");
+        }
+        assert_eq!(blob.id, expected);
+
+        let decoded = image::load_from_memory(bytes).expect("the bytes are a PNG");
+        assert_eq!((decoded.width(), decoded.height()), (2, 3));
+    }
 
     /// A scratch directory unique to this process and test, removed at creation to start clean.
     fn unique_temp_dir(name: &str) -> PathBuf {

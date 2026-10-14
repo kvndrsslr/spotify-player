@@ -29,8 +29,6 @@ ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 rand = "0.10.2"
 parking_lot = "0.12.5"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-backtrace = "0.3.76"
 image = { version = "0.25.10", optional = true }
 flume = "0.12.0"
 serde_json = "1.0.151"
@@ -43,13 +41,15 @@ rspotify = {version = "0.15.3", features = ["cli"] }
 # fix for https://github.com/aome510/spotify-player/issues/914
 vergen = "=9.0.6"
 ratatui-image = { version = "11.0.6", optional = true, default-features = false, features = ["crossterm"] }
+tern-sdk = { version = "0.1", optional = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies.winit]
 version = "0.30.13"
 optional = true
 
 [features]
-default = ["rodio-backend", "media-control"]
+default = ["rodio-backend", "media-control", "tsp"]
+tsp = ["dep:tern-sdk"]
 # Audio backends live in the core crate; the frontend only forwards them.
 alsa-backend = ["spotify_player_core/alsa-backend"]
 pulseaudio-backend = ["spotify_player_core/pulseaudio-backend"]

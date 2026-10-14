@@ -1,6 +1,10 @@
+//! Keybindings: the defaults, the merge with the user's `keymap.toml`, and key-sequence lookup.
+//!
+//! Loaded once by [`crate::config::Configs`] and read by every frontend.
+
 use crate::{
     command::{Action, ActionTarget, Command, CommandOrAction},
-    key::{Key, KeySequence},
+    key::KeySequence,
 };
 use anyhow::Result;
 use serde::Deserialize;
@@ -386,6 +390,7 @@ impl KeymapConfig {
     }
 
     /// finds all keymaps whose mapped key sequence has a given `prefix` key sequence as its prefix
+    #[must_use]
     pub fn find_matched_prefix_keymaps(&self, prefix: &KeySequence) -> Vec<&Keymap> {
         self.keymaps
             .iter()
@@ -394,6 +399,7 @@ impl KeymapConfig {
     }
 
     /// finds all actions whose mapped key sequence has a given `prefix` key sequence as its prefix
+    #[must_use]
     pub fn find_matched_prefix_actions(&self, prefix: &KeySequence) -> Vec<&ActionMap> {
         self.actions
             .iter()
@@ -402,6 +408,7 @@ impl KeymapConfig {
     }
 
     /// checks if there is any command or action that has a given `prefix` key sequence as its prefix
+    #[must_use]
     pub fn has_matched_prefix(&self, prefix: &KeySequence) -> bool {
         let keymaps = self.find_matched_prefix_keymaps(prefix);
         let actions = self.find_matched_prefix_actions(prefix);
@@ -409,6 +416,7 @@ impl KeymapConfig {
     }
 
     /// finds a command from a mapped key sequence
+    #[must_use]
     pub fn find_command_from_key_sequence(&self, key_sequence: &KeySequence) -> Option<Command> {
         self.keymaps
             .iter()
@@ -417,6 +425,7 @@ impl KeymapConfig {
     }
 
     /// finds an action from a mapped key sequence
+    #[must_use]
     pub fn find_action_from_key_sequence(
         &self,
         key_sequence: &KeySequence,
@@ -428,6 +437,7 @@ impl KeymapConfig {
     }
 
     /// finds a command or action from a mapped key sequence
+    #[must_use]
     pub fn find_command_or_action_from_key_sequence(
         &self,
         key_sequence: &KeySequence,
@@ -443,6 +453,7 @@ impl KeymapConfig {
 }
 
 impl Keymap {
+    #[must_use]
     pub fn include_in_help_screen(&self) -> bool {
         !matches!(&self.command, Command::None)
     }
@@ -460,22 +471,88 @@ impl std::fmt::Display for Keymap {
     }
 }
 
-impl From<&str> for Key {
-    /// converts a string into a `Key`.
-    /// # Panics
-    /// This function will panic if the given string is not a valid
-    /// representation of a `Key`.
-    fn from(s: &str) -> Self {
-        Self::from_str(s).unwrap_or_else(|| panic!("invalid key {s}"))
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl From<&str> for KeySequence {
-    /// converts a string into a `KeySequence`.
-    /// # Panics
-    /// This function will panic if the given string is not a valid
-    /// representation of a `KeySequence`.
-    fn from(s: &str) -> Self {
-        Self::from_str(s).unwrap_or_else(|| panic!("invalid key sequence {s}"))
+    #[test]
+    fn default_keymaps_resolve() {
+        let config = KeymapConfig::default();
+
+        for (sequence, command) in [
+            ("n", Command::NextTrack),
+            ("enter", Command::ChooseSelected),
+            ("space", Command::ResumePause),
+            ("C-c", Command::Quit),
+            ("page_up", Command::PageSelectPreviousOrScrollUp),
+            ("G", Command::SelectLastOrScrollToBottom),
+        ] {
+            let sequence = KeySequence::from_str(sequence).expect("parses");
+            assert_eq!(
+                config.find_command_from_key_sequence(&sequence),
+                Some(command),
+                "{sequence} should map to {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_key_bindings_need_their_prefix() {
+        let config = KeymapConfig::default();
+        let prefix = KeySequence::from_str("g").expect("parses");
+        let full = KeySequence::from_str("g a").expect("parses");
+
+        assert!(
+            config.has_matched_prefix(&prefix),
+            "`g` starts `g a`/`g t`/…"
+        );
+        assert_eq!(config.find_command_from_key_sequence(&prefix), None);
+        assert_eq!(
+            config.find_command_from_key_sequence(&full),
+            Some(Command::ShowActionsOnSelectedItem)
+        );
+
+        let unmatched = KeySequence::from_str("C-x 9").expect("parses");
+        assert!(!config.has_matched_prefix(&unmatched));
+    }
+
+    #[test]
+    fn parse_config_file_overrides_and_keeps_one_command_per_sequence() {
+        let dir = std::env::temp_dir().join(format!("sp-keymap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp config folder");
+        std::fs::write(
+            dir.join(crate::config::KEYMAP_CONFIG_FILE),
+            "[[keymaps]]\nkey_sequence = \"n\"\ncommand = \"Quit\"\n\n\
+             [[keymaps]]\nkey_sequence = \"C-x\"\ncommand = \"OpenLogs\"\n",
+        )
+        .expect("write keymap.toml");
+
+        let config = KeymapConfig::new(&dir).expect("loads");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            config.find_command_from_key_sequence(&KeySequence::from_str("n").expect("parses")),
+            Some(Command::Quit),
+            "the file overrides the default binding for `n`"
+        );
+        assert_eq!(
+            config.find_command_from_key_sequence(&KeySequence::from_str("C-x").expect("parses")),
+            Some(Command::OpenLogs),
+            "the file adds a new binding"
+        );
+        assert_eq!(
+            config.find_command_from_key_sequence(&KeySequence::from_str("enter").expect("parses")),
+            Some(Command::ChooseSelected),
+            "defaults the file does not mention stay"
+        );
+        assert_eq!(
+            config
+                .keymaps
+                .iter()
+                .filter(|k| k.key_sequence == KeySequence::from_str("n").expect("parses"))
+                .count(),
+            1,
+            "one command per key sequence"
+        );
     }
 }

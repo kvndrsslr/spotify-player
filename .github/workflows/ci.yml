@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  RUST_FEATURES: "rodio-backend,media-control,image,notify,fzf"
+  RUST_FEATURES: "rodio-backend,media-control,image,notify,fzf,tsp"
 
 jobs:
   rust-ci:

@@ -18,6 +18,7 @@
   - [Image](#image)
   - [Notify](#notify)
   - [Mouse support](#mouse-support)
+  - [Rendering frontends](#rendering-frontends)
   - [Daemon](#daemon)
   - [Fuzzy search](#fuzzy-search)
   - [CLI commands](#cli-commands)
@@ -352,6 +353,53 @@ cargo install spotify_player --features notify
 ### Mouse support
 
 Mouse support: You can seek to a position in the playback by left-clicking the progress bar.
+
+### Rendering frontends
+
+The application can draw itself in more than one way. Pick one with `-f`/`--frontend` on the
+command line, or with the `frontend` option in `app.toml`; the command line wins.
+
+| Value  | Frontend                                                                                                                                                 |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto` | The default. In a [Tern](https://stencil.so) terminal it uses the Tern Surface Protocol frontend; everywhere else it uses the TUI, without probing.        |
+| `tui`  | The ratatui TUI.                                                                                                                                          |
+| `tsp`  | The Tern Surface Protocol frontend: Tern lays out, draws and scrolls the UI itself. Requires a build with the `tsp` feature (on by default) and a terminal that speaks TSP. |
+
+In `auto` mode the frontend is chosen from the environment before the terminal is touched: if
+`TERM_PROGRAM=tern` (and the session is not inside `tmux`/`screen`/`zellij`, and `TERN_TSP` is not
+`0`), the TSP handshake is attempted and the TUI is used if it gets no reply; otherwise the TUI
+starts directly, with no extra startup delay.
+
+**Notes**:
+
+- `TERM_PROGRAM` does not survive `ssh`, so over `ssh` use `--frontend tsp` explicitly — the TSP
+  handshake itself works there.
+- `--frontend tsp` fails when the build has no `tsp` feature or the terminal does not speak TSP,
+  instead of silently running the TUI.
+- `-o frontend=tsp` (the `--config-override` form) works as well; an unknown value in `app.toml`
+  is ignored with a warning and `auto` is used.
+- Every page the TUI draws has a Tern document: the library, search, context, browse, lyrics, queue,
+  command help and logs pages, the playback bar, and every popup (devices, themes, action lists,
+  playlist creation, confirmations and the browse lists). Album art is sent as a content-addressed
+  blob, so Tern caches it across restarts.
+- Keys go through the same keymap as the TUI, and Tern's pointer events select and activate the same
+  rows. The protocol draws four limits:
+  - A click cannot seek to a position: Tern reports no click coordinates, so the progress bar offers
+    fixed seek positions through its context menu.
+  - Tern owns scrolling and hover, so the app's scroll commands move Tern's scroll containers rather
+    than a locally drawn viewport, and the row under the pointer is Tern's highlight.
+  - The frontend does not use Tern's native editing (the handshake asks for no `edit`/`undo`/`send`
+    feature), so the app keeps the text and the caret itself, exactly as the TUI does; a pasted
+    string is replayed as the key presses for its characters.
+  - A theme that styles with the terminal's ANSI colours has no fixed colours to send, so the palette
+    leaves those tokens out and Tern draws them from its own theme; changing theme re-sends the
+    palette.
+- To exercise the frontend against a real Tern (a headless pane driven with injected keys and
+  clicks, plus a recording of every TSP message), see [docs/tsp-testing.md](docs/tsp-testing.md).
+- The choice and its reason are logged: grep `Frontend:` and `Tern detected` in the log under the
+  cache folder (`~/.cache/spotify-player/spotify-player-*.log`). The log names whether `--frontend`,
+  `app.toml` or the default `auto` won, and for `auto` the signal that decided it — the
+  `TERM_PROGRAM` value seen, or (at `DEBUG` level) which variable blocked the Tern hint.
 
 ### Daemon
 

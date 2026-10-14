@@ -1,3 +1,5 @@
+use crate::key::{Key, KeyCode};
+
 /// The effect of an editing operation on a [`TextInput`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEffect {
@@ -21,6 +23,19 @@ pub struct TextInput {
 }
 
 impl TextInput {
+    /// Applies a key press as an editing operation.
+    ///
+    /// Returns `None` when the key has no editing meaning, so the caller can handle it instead.
+    pub fn handle_key(&mut self, key: &Key) -> Option<InputEffect> {
+        match *key {
+            Key::None(KeyCode::Char(c)) => Some(self.insert_char(c)),
+            Key::None(KeyCode::Backspace) => Some(self.backspace()),
+            Key::None(KeyCode::Left) => Some(self.move_left()),
+            Key::None(KeyCode::Right) => Some(self.move_right()),
+            _ => None,
+        }
+    }
+
     /// Inserts `c` at the cursor and moves the cursor past it.
     pub fn insert_char(&mut self, c: char) -> InputEffect {
         if self.cursor == self.line.len() {

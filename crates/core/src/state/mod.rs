@@ -22,7 +22,13 @@ pub use parking_lot::{Mutex, RwLock};
 /// Application's shared state
 pub type SharedState = Arc<State>;
 
-/// Application's state
+/// Application's state.
+///
+/// The guards `view`, `data` and `player` are taken in that order by every path that holds more
+/// than one at a time, and no path may hold two guards of the *same* lock: the client task, the
+/// player-event watcher, the media-control thread and a frontend's render loop run concurrently, so
+/// a reverse acquisition (a `data` guard taken under `player`, say) closes a cycle with the client
+/// task's writes and parks both threads.
 pub struct State {
     pub view: Mutex<ViewState>,
     pub player: RwLock<PlayerState>,
@@ -42,6 +48,13 @@ pub struct State {
     /// without re-enqueueing every frame.
     #[cfg(feature = "image")]
     pub image_window_signature: Mutex<Option<(String, String)>>,
+    /// The encoded cover art every frontend names by id, keyed by image url (see
+    /// [`State::image_blob`]).
+    ///
+    /// Deliberately not in [`AppData`]: a frontend draws cover art while it *holds* a guard on the
+    /// data cache, and filling this cache must not need another `data` lock.
+    #[cfg(feature = "image")]
+    encoded_images: Mutex<ttl_cache::TtlCache<String, ImageBlob>>,
 
     pub is_daemon: bool,
 
@@ -67,6 +80,8 @@ impl State {
             image_fetch_queue: Mutex::new(Vec::new()),
             #[cfg(feature = "image")]
             image_window_signature: Mutex::new(None),
+            #[cfg(feature = "image")]
+            encoded_images: Mutex::new(ttl_cache::TtlCache::new(16)),
             data: RwLock::new(app_data),
             is_daemon,
             #[cfg(feature = "streaming")]
@@ -79,6 +94,45 @@ impl State {
             },
 
             logs: log_buffer,
+        }
+    }
+
+    /// The encoded, content-addressed bytes of a cached cover image, or `None` when the url's
+    /// image is not in `data` yet — queue it with [`State::queue_image_fetch`] and retry.
+    ///
+    /// Encodes once per url, into the cache behind [`State::encoded_images`].
+    ///
+    /// Takes the data guard the caller already holds instead of locking `data` itself: cover art is
+    /// drawn *while* a guard on that cache is alive, and a nested acquisition would block forever on
+    /// the guard the caller's own thread holds (a write lock can never be granted then, and a read
+    /// lock waits for the queued writer that our read is blocking). Reading the image through
+    /// `data` and encoding it here keeps this call lock-free with respect to the data cache.
+    #[cfg(feature = "image")]
+    pub fn image_blob(&self, data: &AppData, url: &str) -> Option<ImageBlob> {
+        if let Some(blob) = self.encoded_images.lock().get(url) {
+            return Some(blob.clone());
+        }
+
+        // Whichever cache holds the decoded image, mirroring the render paths.
+        let image = data
+            .caches
+            .images
+            .get(url)
+            .or_else(|| data.caches.episode_images.get(url))?;
+
+        match ImageBlob::encode(image) {
+            Ok(blob) => {
+                self.encoded_images.lock().insert(
+                    url.to_owned(),
+                    blob.clone(),
+                    *TTL_CACHE_DURATION,
+                );
+                Some(blob)
+            }
+            Err(err) => {
+                tracing::warn!("Failed to encode the cover image for {url}: {err:#}");
+                None
+            }
         }
     }
 

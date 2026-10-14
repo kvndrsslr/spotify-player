@@ -45,6 +45,7 @@ spotify_player -o device.volume=80 -o theme=dracula
 | `ap_port`                         | Spotify session connection port.                                                                     | `None`                                                                 |
 | `proxy`                           | Spotify session connection proxy.                                                                    | `None`                                                                 |
 | `theme`                           | Name of the theme to use.                                                                            | `default`                                                              |
+| `frontend`                        | Rendering frontend to use: `auto`, `tui`, or `tsp` (see [Rendering frontends](../README.md#rendering-frontends)). An unknown value warns and falls back to `auto`. | `auto` |
 | `app_refresh_duration_in_ms`      | Interval (ms) between application refreshes.                                                         | `32`                                                                   |
 | `playback_refresh_duration_in_ms` | Interval (ms) between playback refreshes.                                                            | `0`                                                                    |
 | `page_size_in_rows`               | Number of rows per page for navigation.                                                              | `20`                                                                   |

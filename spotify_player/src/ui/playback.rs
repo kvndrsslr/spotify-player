@@ -1,11 +1,9 @@
 use super::{
     config, utils::construct_and_render_block, Alignment, Borders, Constraint, Ctx, Frame, Gauge,
-    Layout, Line, LineGauge, Modifier, Paragraph, PlaybackMetadata, ProgressBarLayout, Rect,
-    SharedState, Span, Style, Text, Wrap,
+    Layout, Line, LineGauge, Modifier, Paragraph, ProgressBarLayout, Rect, SharedState, Span,
+    Style, Text, Wrap,
 };
-use crate::utils::to_bidi_string;
-use crate::{state::Track, ui::utils::format_genres};
-use rspotify::model::Id;
+use crate::playback::{current_playback_spans, PlaybackSpan, PlaybackToken};
 
 /// Render a playback window showing information about the current playback, which includes
 /// - track title, artists, album
@@ -99,11 +97,13 @@ pub fn render_playback_window(
                 }
             };
 
-            if let Some(ref playback) = player.buffered_playback {
-                let playback_text = construct_playback_text(ui, state, item, playback);
-                let playback_desc = Paragraph::new(playback_text);
-                frame.render_widget(playback_desc, metadata_rect);
-            }
+            let playback_desc = {
+                // the spans read the data cache; take its guard here rather than nesting one inside
+                // the frame's other locks
+                let data = state.data.read();
+                playback_text(current_playback_spans(&data, &player), &ui.tui.theme)
+            };
+            frame.render_widget(Paragraph::new(playback_desc), metadata_rect);
 
             let duration = match item {
                 rspotify::model::PlayableItem::Track(track) => track.duration,
@@ -197,178 +197,38 @@ fn cover_img_length(configs: &config::Configs, picker: &ratatui_image::picker::P
     }
 }
 
-fn construct_playback_text(
-    ui: &Ctx<'_>,
-    state: &SharedState,
-    playable: &rspotify::model::PlayableItem,
-    playback: &PlaybackMetadata,
-) -> Text<'static> {
-    // Construct a "styled" text (`playback_text`) from playback's data
-    // based on a user-configurable format string (app_config.playback_format)
-    let configs = config::get_config();
-    let format_str = &configs.app_config.playback_format;
-    let data = state.data.read();
-
+/// Converts the framework-agnostic playback description into styled text.
+fn playback_text(lines: Vec<Vec<PlaybackSpan>>, theme: &crate::theme::Theme) -> Text<'static> {
     let mut playback_text = Text::default();
-    let mut spans = vec![];
 
-    // this regex is to handle a format argument or a newline
-    let re = regex::Regex::new(r"\{.*?\}|\n").unwrap();
+    for spans in lines {
+        let spans = spans
+            .into_iter()
+            .map(|span| match span.token {
+                // literal runs are drawn unstyled
+                PlaybackToken::Literal => Span::raw(span.text),
+                token => Span::styled(span.text, playback_style(token, theme)),
+            })
+            .collect::<Vec<_>>();
 
-    let mut ptr = 0;
-    for m in re.find_iter(format_str) {
-        let s = m.start();
-        let e = m.end();
-        if ptr < s {
-            spans.push(Span::raw(format_str[ptr..s].to_string()));
-        }
-        ptr = e;
-
-        let (text, style) = match m.as_str() {
-            // upon encountering a newline, create a new `Spans`
-            "\n" => {
-                let mut tmp = vec![];
-                std::mem::swap(&mut tmp, &mut spans);
-                playback_text.lines.push(Line::from(tmp));
-                continue;
-            }
-            "{status}" => (
-                if playback.is_playing {
-                    &configs.app_config.play_icon
-                } else {
-                    &configs.app_config.pause_icon
-                }
-                .to_owned(),
-                ui.tui.theme.playback_status(),
-            ),
-            "{liked}" => match playable {
-                rspotify::model::PlayableItem::Track(track) => match &track.id {
-                    Some(id) => {
-                        if data.user_data.saved_tracks.contains_key(&id.uri()) {
-                            (configs.app_config.liked_icon.clone(), ui.tui.theme.like())
-                        } else {
-                            continue;
-                        }
-                    }
-                    None => continue,
-                },
-                rspotify::model::PlayableItem::Episode(_)
-                | rspotify::model::PlayableItem::Unknown(_) => continue,
-            },
-            "{track}" => match playable {
-                rspotify::model::PlayableItem::Track(track) => (
-                    {
-                        let display = Track::try_from_full_track(track.clone()).map_or_else(
-                            || "Unknown Track".to_string(),
-                            |t| to_bidi_string(&t.display_name()),
-                        );
-                        display
-                    },
-                    ui.tui.theme.playback_track(),
-                ),
-                rspotify::model::PlayableItem::Episode(episode) => (
-                    {
-                        let bidi_string = to_bidi_string(&episode.name);
-                        if episode.explicit {
-                            format!("{bidi_string} (E)")
-                        } else {
-                            bidi_string
-                        }
-                    },
-                    ui.tui.theme.playback_track(),
-                ),
-                rspotify::model::PlayableItem::Unknown(_) => {
-                    continue;
-                }
-            },
-            "{track_number}" => match playable {
-                rspotify::model::PlayableItem::Track(track) => (
-                    { to_bidi_string(&track.track_number.to_string()) },
-                    ui.tui.theme.playback_track(),
-                ),
-                rspotify::model::PlayableItem::Episode(_)
-                | rspotify::model::PlayableItem::Unknown(_) => {
-                    continue;
-                }
-            },
-            "{artists}" => match playable {
-                rspotify::model::PlayableItem::Track(track) => (
-                    to_bidi_string(&crate::utils::map_join(&track.artists, |a| &a.name, ", ")),
-                    ui.tui.theme.playback_artists(),
-                ),
-                rspotify::model::PlayableItem::Episode(episode) => (
-                    episode.show.publisher.clone(),
-                    ui.tui.theme.playback_artists(),
-                ),
-                rspotify::model::PlayableItem::Unknown(_) => {
-                    continue;
-                }
-            },
-            "{album}" => match playable {
-                rspotify::model::PlayableItem::Track(track) => (
-                    to_bidi_string(&track.album.name),
-                    ui.tui.theme.playback_album(),
-                ),
-                rspotify::model::PlayableItem::Episode(episode) => (
-                    to_bidi_string(&episode.show.name),
-                    ui.tui.theme.playback_album(),
-                ),
-                rspotify::model::PlayableItem::Unknown(_) => {
-                    continue;
-                }
-            },
-            "{genres}" => match playable {
-                rspotify::model::PlayableItem::Track(full_track) => {
-                    let genre = match data.caches.genres.get(&full_track.artists[0].name) {
-                        Some(genres) => &format_genres(genres, configs.app_config.genre_num),
-                        None => "no genre",
-                    };
-                    (to_bidi_string(genre), ui.tui.theme.playback_genres())
-                }
-                rspotify::model::PlayableItem::Episode(_) => {
-                    (to_bidi_string("no genre"), ui.tui.theme.playback_genres())
-                }
-                rspotify::model::PlayableItem::Unknown(_) => {
-                    continue;
-                }
-            },
-            "{metadata}" => {
-                let repeat_value = <&'static str>::from(playback.repeat_state).to_string();
-
-                let volume_value = if let Some(volume) = playback.mute_state {
-                    format!("{volume}% (muted)")
-                } else {
-                    format!("{}%", playback.volume.unwrap_or_default())
-                };
-
-                let mut parts = vec![];
-
-                for field in &configs.app_config.playback_metadata_fields {
-                    match field.as_str() {
-                        "repeat" => parts.push(format!("repeat: {repeat_value}")),
-                        "shuffle" => parts.push(format!("shuffle: {}", playback.shuffle_state)),
-                        "volume" => parts.push(format!("volume: {volume_value}")),
-                        "device" => parts.push(format!("device: {}", playback.device_name)),
-                        _ => {}
-                    }
-                }
-
-                let metadata_str = parts.join(" | ");
-                (metadata_str, ui.tui.theme.playback_metadata())
-            }
-            _ => continue,
-        };
-
-        spans.push(Span::styled(text, style));
-    }
-    if ptr < format_str.len() {
-        spans.push(Span::raw(format_str[ptr..].to_string()));
-    }
-    if !spans.is_empty() {
         playback_text.lines.push(Line::from(spans));
     }
 
     playback_text
+}
+
+/// The theme style of a playback run.
+fn playback_style(token: PlaybackToken, theme: &crate::theme::Theme) -> Style {
+    match token {
+        PlaybackToken::Literal => Style::default(),
+        PlaybackToken::Status => theme.playback_status(),
+        PlaybackToken::Liked => theme.like(),
+        PlaybackToken::Track | PlaybackToken::TrackNumber => theme.playback_track(),
+        PlaybackToken::Artists => theme.playback_artists(),
+        PlaybackToken::Album => theme.playback_album(),
+        PlaybackToken::Genres => theme.playback_genres(),
+        PlaybackToken::Metadata => theme.playback_metadata(),
+    }
 }
 
 fn render_playback_progress_bar(

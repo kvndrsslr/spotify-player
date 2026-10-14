@@ -1,4 +1,4 @@
-use crate::{command::Command, utils::filtered_items_from_query};
+use crate::{command::Command, config, utils::filtered_items_from_query};
 
 use super::{
     single_line_input, utils, utils::construct_and_render_block, Borders, Cell, Constraint, Ctx,
@@ -272,7 +272,7 @@ pub fn render_shortcut_help_popup(frame: &mut Frame, ui: &mut Ctx<'_>, rect: Rec
         if input.keys.is_empty() {
             vec![]
         } else {
-            crate::frontend_config::get()
+            config::get_config()
                 .keymap_config
                 .find_matched_prefix_keymaps(input)
                 .into_iter()

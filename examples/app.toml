@@ -1,4 +1,5 @@
 theme = "default"
+frontend = "auto"
 login_redirect_uri = "http://127.0.0.1:8989/login"
 client_id = "d420a117a32841c2b3474932e49fb54b"
 client_port = 8080

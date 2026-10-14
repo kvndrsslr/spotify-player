@@ -859,7 +859,7 @@ pub fn render_lyrics_page(
 pub fn render_commands_help_page(frame: &mut Frame, ui: &mut Ctx<'_>, rect: Rect) {
     // 1. Get data
     let mut map = BTreeMap::new();
-    let keymaps = ui.search_filtered_items(&crate::frontend_config::get().keymap_config.keymaps);
+    let keymaps = ui.search_filtered_items(&config::get_config().keymap_config.keymaps);
     keymaps
         .into_iter()
         .filter(|km| km.include_in_help_screen())

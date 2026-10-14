@@ -7,7 +7,7 @@ const APP_CONFIG_FILE: &str = "app.toml";
 pub const THEME_CONFIG_FILE: &str = "theme.toml";
 /// Name of the keymap configuration file inside the config folder.
 ///
-/// Core does not interpret it; a frontend loads it itself.
+/// Core loads it into [`Configs::keymap_config`], so every frontend binds the user's keys the same.
 pub const KEYMAP_CONFIG_FILE: &str = "keymap.toml";
 
 use anyhow::{anyhow, Result};
@@ -29,8 +29,10 @@ static CONFIGS: OnceLock<Configs> = OnceLock::new();
 #[derive(Debug)]
 pub struct Configs {
     pub app_config: AppConfig,
+    /// The user's keybindings ([`KEYMAP_CONFIG_FILE`] plus the defaults), shared by every frontend.
+    pub keymap_config: crate::keymap::KeymapConfig,
     /// Folder holding the application's configuration files, including the frontend-owned
-    /// [`THEME_CONFIG_FILE`] and [`KEYMAP_CONFIG_FILE`].
+    /// [`THEME_CONFIG_FILE`].
     pub config_folder: std::path::PathBuf,
     /// Folder holding the application's cache, including fetched cover images.
     pub cache_folder: std::path::PathBuf,
@@ -40,6 +42,7 @@ impl Configs {
     pub fn new(config_folder: &std::path::Path, cache_folder: &std::path::Path) -> Result<Self> {
         Ok(Self {
             app_config: AppConfig::new(config_folder)?,
+            keymap_config: crate::keymap::KeymapConfig::new(config_folder)?,
             config_folder: config_folder.to_path_buf(),
             cache_folder: cache_folder.to_path_buf(),
         })
@@ -51,6 +54,11 @@ impl Configs {
 /// Application configurations
 pub struct AppConfig {
     pub theme: String,
+    /// The rendering frontend to run: `auto`, `tui` or `tsp`.
+    ///
+    /// The binary interprets it (see its `frontend` module); an unknown value is ignored with a
+    /// warning and `auto` is used.
+    pub frontend: String,
     pub client_id: String,
     pub client_id_command: Option<Command>,
 
@@ -332,6 +340,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: "dracula".to_owned(),
+            frontend: "auto".to_owned(),
             // Use ncspot's client ID as a fallback for user-provided client ID
             //
             // Most of the time, using ncspot's client ID is better than user-provided one

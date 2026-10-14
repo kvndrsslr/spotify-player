@@ -1,6 +1,6 @@
 use super::{
     controller, page, single_line_input, ActionListItem, AlbumId, ArtistId, ArtistPopupAction,
-    ClientRequest, Command, ContextId, ContextPageType, Ctx, Cursor, Id, Key, KeySequence,
+    ClientRequest, Command, ContextId, ContextPageType, Ctx, Cursor, Id, Key, KeyCode, KeySequence,
     PageState, PlayerRequest, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistId,
     PlaylistPopupAction, PopupState, Result, SharedState,
 };
@@ -50,13 +50,101 @@ pub fn handle_key_sequence_for_popup(
         _ => {}
     }
 
-    let Some(command) = crate::frontend_config::get()
+    let Some(command) = crate::config::get_config()
         .keymap_config
         .find_command_from_key_sequence(key_sequence)
     else {
         return Ok(false);
     };
 
+    handle_command_for_popup(command, client_pub, state, ui)
+}
+
+/// Runs what Enter does in the currently open popup.
+///
+/// The search, create-playlist, action-list and confirm popups are handled before the command
+/// path — they read raw keys, not commands — so a frontend that has no key press to give (Tern's
+/// `activate`, a click) chooses through here instead. Returns `false` when the popup is one the
+/// command path already covers.
+// the only caller today is the TSP frontend's `activate`
+#[cfg(feature = "tsp")]
+pub fn choose_in_current_popup(
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut Ctx<'_>,
+) -> Result<bool> {
+    // the popup is borrowed immutably to read the choice, then mutated to run it
+    enum Choice {
+        Command,
+        Create { name: String, desc: String },
+        Action(usize),
+        Confirm(ConfirmableAction),
+    }
+
+    let Some(choice) = (match ui.popup.as_ref() {
+        Some(PopupState::Search { .. }) => Some(Choice::Command),
+        Some(PopupState::PlaylistCreate { name, desc, .. }) => Some(Choice::Create {
+            name: name.text(),
+            desc: desc.text(),
+        }),
+        Some(PopupState::ActionList(item, cursor)) => {
+            let index = cursor.selected().unwrap_or(0);
+            (index < item.n_actions()).then_some(Choice::Action(index))
+        }
+        Some(PopupState::ConfirmAction { action, .. }) => Some(Choice::Confirm(action.clone())),
+        _ => None,
+    }) else {
+        return Ok(false);
+    };
+
+    match choice {
+        Choice::Command => {
+            let page_type = ui.current_page().page_type();
+            page::handle_command_for_page(Command::ChooseSelected, page_type, client_pub, state, ui)
+        }
+        Choice::Create { name, desc } => {
+            client_pub.send(ClientRequest::CreatePlaylist {
+                playlist_name: name,
+                public: false,
+                collab: false,
+                desc,
+            })?;
+            ui.popup = None;
+            Ok(true)
+        }
+        Choice::Action(index) => {
+            controller::handle_item_action(index, client_pub, state, ui.view_mut())
+        }
+        Choice::Confirm(action) => {
+            match action {
+                ConfirmableAction::DeleteTrackFromPlaylist {
+                    playlist_id,
+                    track_id,
+                } => {
+                    client_pub.send(ClientRequest::DeleteTrackFromPlaylist(
+                        playlist_id,
+                        track_id,
+                    ))?;
+                }
+                ConfirmableAction::DeleteFromLibrary(item_id) => {
+                    client_pub.send(ClientRequest::DeleteFromLibrary(item_id))?;
+                }
+            }
+            ui.popup = None;
+            Ok(true)
+        }
+    }
+}
+
+/// Handles `command` for the currently open popup.
+///
+/// Shared with frontends that run a command without a key press (Tern's `activate`).
+pub fn handle_command_for_popup(
+    command: crate::command::Command,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut Ctx<'_>,
+) -> Result<bool> {
     match ui.popup.as_ref().context("empty popup")? {
         PopupState::ConfirmAction { .. } => {
             anyhow::bail!("confirm action should be handled before")
@@ -347,7 +435,7 @@ fn handle_key_sequence_for_create_playlist_popup(
     };
     if key_sequence.keys.len() == 1 {
         match &key_sequence.keys[0] {
-            Key::None(crossterm::event::KeyCode::Enter) => {
+            Key::None(KeyCode::Enter) => {
                 client_pub.send(ClientRequest::CreatePlaylist {
                     playlist_name: name.text(),
                     public: false,
@@ -357,7 +445,7 @@ fn handle_key_sequence_for_create_playlist_popup(
                 ui.popup = None;
                 return Ok(true);
             }
-            Key::None(crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::BackTab) => {
+            Key::None(KeyCode::Tab | KeyCode::BackTab) => {
                 *current_field = match &current_field {
                     PlaylistCreateCurrentField::Name => PlaylistCreateCurrentField::Desc,
                     PlaylistCreateCurrentField::Desc => PlaylistCreateCurrentField::Name,
@@ -391,12 +479,12 @@ fn handle_key_sequence_for_search_popup(
     if key_sequence.keys.len() == 1 {
         if let Key::None(c) = key_sequence.keys[0] {
             match c {
-                crossterm::event::KeyCode::Char(c) => {
+                KeyCode::Char(c) => {
                     query.push(c);
                     ui.current_page_mut().select(0);
                     return Ok(true);
                 }
-                crossterm::event::KeyCode::Backspace => {
+                KeyCode::Backspace => {
                     if query.is_empty() {
                         // close search popup when user presses backspace on empty search
                         ui.popup = None;
@@ -518,7 +606,7 @@ fn handle_key_sequence_for_action_list_popup(
     state: &SharedState,
     ui: &mut Ctx<'_>,
 ) -> Result<bool> {
-    if let Some(Key::None(crossterm::event::KeyCode::Char(c))) = key_sequence.keys.first() {
+    if let Some(Key::None(KeyCode::Char(c))) = key_sequence.keys.first() {
         if let Some(id) = c.to_digit(10) {
             let id = id as usize;
             if id < n_actions {
@@ -528,7 +616,7 @@ fn handle_key_sequence_for_action_list_popup(
         }
     }
 
-    let Some(command) = crate::frontend_config::get()
+    let Some(command) = crate::config::get_config()
         .keymap_config
         .find_command_from_key_sequence(key_sequence)
     else {
@@ -569,7 +657,7 @@ fn handle_key_sequence_for_playlist_search_popup(
     if key_sequence.keys.len() == 1 {
         if let Key::None(c) = key_sequence.keys[0] {
             match c {
-                crossterm::event::KeyCode::Char(c) => {
+                KeyCode::Char(c) => {
                     search_query.push(c);
                     // Reset selection to first item when search query changes
                     if let Some(popup) = &mut ui.popup {
@@ -577,7 +665,7 @@ fn handle_key_sequence_for_playlist_search_popup(
                     }
                     return true;
                 }
-                crossterm::event::KeyCode::Backspace => {
+                KeyCode::Backspace => {
                     if search_query.is_empty() {
                         // Close playlist popup when user presses backspace on empty search
                         ui.popup = None;
@@ -606,7 +694,7 @@ fn handle_key_sequence_for_confirm_popup(
 ) -> Result<bool> {
     if matches!(
         key_sequence.keys.as_slice(),
-        [Key::None(crossterm::event::KeyCode::Char('y'))]
+        [Key::None(KeyCode::Char('y'))]
     ) {
         match action {
             ConfirmableAction::DeleteTrackFromPlaylist {

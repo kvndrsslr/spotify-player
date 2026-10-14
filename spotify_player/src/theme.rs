@@ -614,3 +614,120 @@ impl Default for Palette {
         }
     }
 }
+
+/// Inserts `style`'s text colour as a palette token, when it has an RGB value.
+#[cfg(feature = "tsp")]
+fn insert_text(
+    palette: &mut std::collections::BTreeMap<String, String>,
+    token: &str,
+    style: style::Style,
+) {
+    if let Some(hex) = hex(style.fg) {
+        palette.insert(token.to_owned(), hex);
+    }
+}
+
+/// Inserts `style`'s fill colour as a palette token, when it has an RGB value.
+#[cfg(feature = "tsp")]
+fn insert_fill(
+    palette: &mut std::collections::BTreeMap<String, String>,
+    token: &str,
+    style: style::Style,
+) {
+    if let Some(hex) = hex(style.bg) {
+        palette.insert(token.to_owned(), hex);
+    }
+}
+
+#[cfg(feature = "tsp")]
+impl Theme {
+    /// The Tern program palette: the theme's colours as `token -> #rrggbb`.
+    ///
+    /// Only colours the theme resolves to an RGB value are sent. The default theme styles with the
+    /// terminal's ANSI colours, which have no fixed value: those tokens are left out, and Tern draws
+    /// them from its own theme (the protocol's documented behaviour for a terminal default).
+    #[must_use]
+    pub fn tsp_palette(&self) -> std::collections::BTreeMap<String, String> {
+        let mut palette = std::collections::BTreeMap::new();
+
+        for (token, style) in [
+            ("accent", self.block_title()),
+            ("muted", self.playback_metadata()),
+            ("dim", self.playback_genres()),
+            ("success", self.current_playing()),
+            ("warning", self.playback_album()),
+            ("error", self.like()),
+            ("info", self.table_header()),
+            ("text", self.app()),
+            ("mdLink", self.page_desc()),
+            ("mdCode", self.playlist_desc()),
+            ("mdHeading", self.block_title()),
+            ("statusLineModel", self.playback_track()),
+            ("statusLinePath", self.playback_artists()),
+            ("syntaxComment", self.playback_metadata()),
+            ("syntaxString", self.playback_album()),
+            ("syntaxKeyword", self.table_header()),
+            ("toolDiffAdded", self.current_playing()),
+            ("toolDiffRemoved", self.playback_artists()),
+        ] {
+            insert_text(&mut palette, token, style);
+        }
+
+        for (token, style) in [
+            ("selectedBg", self.selection(true)),
+            ("statusLineBg", self.app()),
+            ("cardBg", self.app()),
+        ] {
+            insert_fill(&mut palette, token, style);
+        }
+
+        palette
+    }
+}
+
+/// A colour's `#rrggbb` form, when it has one.
+#[cfg(feature = "tsp")]
+fn hex(color: Option<style::Color>) -> Option<String> {
+    match color? {
+        style::Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "tsp"))]
+mod tsp_palette_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_theme_sends_no_palette() {
+        // the default theme styles with the terminal's ANSI colours, which have no fixed value:
+        // those tokens are left out and Tern draws them from its own theme
+        assert!(Theme::default().tsp_palette().is_empty());
+    }
+
+    #[test]
+    fn rgb_colours_become_palette_tokens() {
+        let theme: Theme = toml::from_str(
+            r##"
+name = "test"
+
+[palette]
+background = "#101010"
+foreground = "#e0e0e0"
+
+[component_style]
+current_playing = { fg = "#00ff00" }
+"##,
+        )
+        .expect("a valid theme");
+
+        let palette = theme.tsp_palette();
+
+        assert_eq!(palette.get("success").map(String::as_str), Some("#00ff00"));
+        assert_eq!(palette.get("text").map(String::as_str), Some("#e0e0e0"));
+        // fills take the palette's background
+        assert_eq!(palette.get("cardBg").map(String::as_str), Some("#101010"));
+        // a token the theme does not colour with an RGB value is Tern's
+        assert_eq!(palette.get("muted"), None);
+    }
+}

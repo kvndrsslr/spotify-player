@@ -366,8 +366,9 @@ pub fn handle_global_action(
     view: &mut ViewStateGuard<'_>,
 ) -> Result<bool> {
     if target == ActionTarget::PlayingTrack {
-        let player = state.player.read();
+        // the shared order: `data` before `player` (see `state::State`)
         let data = state.data.read();
+        let player = state.player.read();
 
         if let Some(currently_playing) = player.currently_playing() {
             match currently_playing {

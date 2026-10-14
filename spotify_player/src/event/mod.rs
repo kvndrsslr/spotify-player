@@ -2,7 +2,7 @@ use crate::{
     client::{ClientRequest, PlayerRequest},
     command::{ActionTarget, Command, CommandOrAction},
     config, controller,
-    key::{Key, KeySequence},
+    key::{Key, KeyCode, KeySequence},
     state::{
         ActionListItem, AlbumId, ArtistId, ArtistPopupAction, ContextId, ContextPageType, Cursor,
         Id, PageState, PageType, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistId,
@@ -11,8 +11,8 @@ use crate::{
     ui::{single_line_input, Ctx, Orientation, SharedUiState},
 };
 use anyhow::Result;
-use crossterm::event::KeyCode;
 
+pub(crate) mod dispatch;
 mod page;
 mod popup;
 
@@ -123,22 +123,58 @@ fn handle_mouse_event(
     Ok(())
 }
 
-/// Open the theme list popup. Handled by the TUI because it owns the resolved themes.
-fn handle_switch_theme(ui: &mut Ctx<'_>) -> bool {
-    // get the available theme names with the current theme moved to the first position
-    let mut themes: Vec<String> = crate::frontend_config::get()
-        .theme_config
-        .themes
-        .iter()
-        .map(|t| t.name.clone())
-        .collect();
-    if let Some(id) = themes.iter().position(|name| *name == ui.tui.theme.name) {
-        let theme = themes.remove(id);
-        themes.insert(0, theme);
+/// Converts a crossterm key code into the core's [`KeyCode`].
+///
+/// `None` for a key the application does not bind (media keys, lock keys, modifiers alone).
+fn key_code_from_crossterm(code: crossterm::event::KeyCode) -> Option<KeyCode> {
+    use crossterm::event::KeyCode as C;
+    Some(match code {
+        C::Char(c) => KeyCode::Char(c),
+        C::Enter => KeyCode::Enter,
+        C::Tab => KeyCode::Tab,
+        C::BackTab => KeyCode::BackTab,
+        C::Backspace => KeyCode::Backspace,
+        C::Esc => KeyCode::Esc,
+
+        C::Left => KeyCode::Left,
+        C::Right => KeyCode::Right,
+        C::Up => KeyCode::Up,
+        C::Down => KeyCode::Down,
+
+        C::Insert => KeyCode::Insert,
+        C::Delete => KeyCode::Delete,
+        C::Home => KeyCode::Home,
+        C::End => KeyCode::End,
+        C::PageUp => KeyCode::PageUp,
+        C::PageDown => KeyCode::PageDown,
+
+        C::F(n) => KeyCode::F(n),
+        _ => return None,
+    })
+}
+
+/// Converts a crossterm key event into the core's [`Key`].
+///
+/// Not a `From` impl: [`Key`] is defined in `spotify_player_core`, which cannot depend on
+/// crossterm.
+fn key_from_event(event: crossterm::event::KeyEvent) -> Key {
+    let mut modifiers = event.modifiers;
+    // if the key combination contains `SHIFT`, remove it
+    // because the `event.code` already represents the with-SHIFT key code
+    if modifiers & crossterm::event::KeyModifiers::SHIFT == crossterm::event::KeyModifiers::SHIFT {
+        modifiers ^= crossterm::event::KeyModifiers::SHIFT;
     }
 
-    ui.popup = Some(PopupState::ThemeList(themes, Cursor::default()));
-    true
+    let Some(code) = key_code_from_crossterm(event.code) else {
+        return Key::Unknown;
+    };
+
+    match modifiers {
+        crossterm::event::KeyModifiers::NONE => Key::None(code),
+        crossterm::event::KeyModifiers::ALT => Key::Alt(code),
+        crossterm::event::KeyModifiers::CONTROL => Key::Ctrl(code),
+        _ => Key::Unknown,
+    }
 }
 
 // Handle a terminal key pressed event
@@ -148,78 +184,85 @@ fn handle_key_event(
     state: &SharedState,
     ui_state: &SharedUiState,
 ) -> Result<()> {
-    let key: Key = event.into();
+    let key = key_from_event(event);
     let mut tui = ui_state.lock();
     let mut ui = Ctx::new(state.view.lock(), &mut tui);
 
-    let mut key_sequence = ui.tui.input_key_sequence.clone();
-    key_sequence.keys.push(key);
+    dispatch::handle_key(key, client_pub, state, &mut ui)
+}
 
-    // check if the current key sequence matches any keymap's prefix
-    // if not, reset the key sequence
-    let keymap_config = &crate::frontend_config::get().keymap_config;
-    if !keymap_config.has_matched_prefix(&key_sequence) {
-        key_sequence = KeySequence { keys: vec![key] };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode as CrosstermKeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: CrosstermKeyCode, modifiers: KeyModifiers) -> Key {
+        key_from_event(KeyEvent::new(code, modifiers))
     }
 
-    tracing::debug!(
-        "Handling key event: {event:?}, current key sequence: {key_sequence:?}, count prefix: {:?}",
-        ui.tui.count_prefix
-    );
-    let handled = {
-        if ui.popup.is_none() {
-            page::handle_key_sequence_for_page(&key_sequence, client_pub, state, &mut ui)?
-        } else {
-            popup::handle_key_sequence_for_popup(&key_sequence, client_pub, state, &mut ui)?
-        }
-    };
-
-    // if the key sequence is not handled, let the global handler handle it
-    let handled = if handled {
-        true
-    } else {
-        match keymap_config.find_command_or_action_from_key_sequence(&key_sequence) {
-            Some(CommandOrAction::Action(action, target)) => {
-                controller::handle_global_action(action, target, client_pub, state, ui.view_mut())?
-            }
-            Some(CommandOrAction::Command(Command::SwitchTheme)) => {
-                // the TUI owns the theme list, so this one command is handled here
-                handle_switch_theme(&mut ui)
-            }
-            Some(CommandOrAction::Command(command)) => {
-                controller::handle_global_command(command, client_pub, state, ui.view_mut())?
-            }
-            None => false,
-        }
-    };
-
-    // if handled, clear the key sequence and count prefix
-    // otherwise, the current key sequence can be a prefix of a command's shortcut
-    if handled {
-        ui.tui.input_key_sequence.keys = vec![];
-        ui.tui.count_prefix = None;
-    } else {
-        // update the count prefix if the key is a digit
-        match key {
-            Key::None(KeyCode::Char(c)) if c.is_ascii_digit() => {
-                let digit = c.to_digit(10).unwrap() as usize;
-                ui.tui.input_key_sequence.keys = vec![];
-                ui.tui.count_prefix = match ui.tui.count_prefix {
-                    Some(count) => Some(count * 10 + digit),
-                    None => {
-                        if digit > 0 {
-                            Some(digit)
-                        } else {
-                            None
-                        }
-                    }
-                };
-            }
-            _ => {
-                ui.tui.input_key_sequence = key_sequence;
-                ui.tui.count_prefix = None;
-            }
+    #[test]
+    fn maps_every_bound_key_code() {
+        for (from, to) in [
+            (CrosstermKeyCode::Char('n'), KeyCode::Char('n')),
+            (CrosstermKeyCode::Char(' '), KeyCode::Char(' ')),
+            (CrosstermKeyCode::Enter, KeyCode::Enter),
+            (CrosstermKeyCode::Tab, KeyCode::Tab),
+            (CrosstermKeyCode::BackTab, KeyCode::BackTab),
+            (CrosstermKeyCode::Backspace, KeyCode::Backspace),
+            (CrosstermKeyCode::Esc, KeyCode::Esc),
+            (CrosstermKeyCode::Left, KeyCode::Left),
+            (CrosstermKeyCode::Right, KeyCode::Right),
+            (CrosstermKeyCode::Up, KeyCode::Up),
+            (CrosstermKeyCode::Down, KeyCode::Down),
+            (CrosstermKeyCode::Insert, KeyCode::Insert),
+            (CrosstermKeyCode::Delete, KeyCode::Delete),
+            (CrosstermKeyCode::Home, KeyCode::Home),
+            (CrosstermKeyCode::End, KeyCode::End),
+            (CrosstermKeyCode::PageUp, KeyCode::PageUp),
+            (CrosstermKeyCode::PageDown, KeyCode::PageDown),
+            (CrosstermKeyCode::F(5), KeyCode::F(5)),
+        ] {
+            assert_eq!(key(from, KeyModifiers::NONE), Key::None(to), "{from:?}");
         }
     }
-    Ok(())
+
+    #[test]
+    fn maps_modifiers_like_the_keymap_strings() {
+        assert_eq!(
+            key(CrosstermKeyCode::Char('n'), KeyModifiers::CONTROL),
+            Key::Ctrl(KeyCode::Char('n'))
+        );
+        assert_eq!(
+            key(CrosstermKeyCode::Char('x'), KeyModifiers::ALT),
+            Key::Alt(KeyCode::Char('x'))
+        );
+        // the code already carries SHIFT, so the modifier itself is dropped
+        assert_eq!(
+            key(CrosstermKeyCode::Char('G'), KeyModifiers::SHIFT),
+            Key::None(KeyCode::Char('G'))
+        );
+        assert_eq!(
+            key(CrosstermKeyCode::BackTab, KeyModifiers::SHIFT),
+            Key::None(KeyCode::BackTab)
+        );
+    }
+
+    #[test]
+    fn unbound_codes_and_modifier_combinations_are_unknown() {
+        assert_eq!(
+            key(
+                CrosstermKeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
+            Key::Unknown
+        );
+        assert_eq!(
+            key(CrosstermKeyCode::Null, KeyModifiers::NONE),
+            Key::Unknown
+        );
+        assert_eq!(
+            key(CrosstermKeyCode::CapsLock, KeyModifiers::NONE),
+            Key::Unknown
+        );
+    }
 }

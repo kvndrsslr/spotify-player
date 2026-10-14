@@ -1,4 +1,3 @@
-use crossterm::event::KeyCode;
 use ratatui::widgets::Widget;
 
 use super::{Line, Modifier, Paragraph, Span, Style};
@@ -11,13 +10,7 @@ use crate::{
 ///
 /// Returns `None` when the key has no editing meaning, so the caller can handle it instead.
 pub fn handle_key(input: &mut TextInput, key: &Key) -> Option<InputEffect> {
-    match key {
-        Key::None(KeyCode::Char(c)) => Some(input.insert_char(*c)),
-        Key::None(KeyCode::Backspace) => Some(input.backspace()),
-        Key::None(KeyCode::Left) => Some(input.move_left()),
-        Key::None(KeyCode::Right) => Some(input.move_right()),
-        _ => None,
-    }
+    input.handle_key(key)
 }
 
 /// Renders a text input, highlighting the character under the cursor when it is active.

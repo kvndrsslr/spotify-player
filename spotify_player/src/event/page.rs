@@ -1,5 +1,5 @@
 use super::{
-    controller, single_line_input, ActionTarget, ClientRequest, CommandOrAction, Ctx, Key,
+    controller, single_line_input, ActionTarget, ClientRequest, CommandOrAction, Ctx, Key, KeyCode,
     KeySequence, PageState, PageType, PlaylistFolderItem, Result, SearchFocusState, SharedState,
 };
 
@@ -10,74 +10,102 @@ pub fn handle_key_sequence_for_page(
     ui: &mut Ctx<'_>,
 ) -> Result<bool> {
     let page_type = ui.current_page().page_type();
-    let count = ui.tui.count_prefix;
     // handle search page separately as it needs access to the raw key sequence
     // as opposed to the matched command
     if page_type == PageType::Search {
         return handle_key_sequence_for_search_page(key_sequence, client_pub, state, ui);
     }
 
-    match crate::frontend_config::get()
+    match crate::config::get_config()
         .keymap_config
         .find_command_or_action_from_key_sequence(key_sequence)
     {
-        Some(CommandOrAction::Command(command)) => match page_type {
-            PageType::Search => anyhow::bail!("page search type should already be handled!"),
-            PageType::Library => controller::handle_command_for_library_page(
-                command,
-                client_pub,
-                ui.view_mut(),
-                state,
-                count,
-            ),
-            PageType::Context => controller::handle_command_for_context_page(
-                command,
-                client_pub,
-                ui.view_mut(),
-                state,
-                count,
-            ),
-            PageType::Browse => controller::handle_command_for_browse_page(
-                command,
-                client_pub,
-                ui.view_mut(),
-                state,
-                count,
-            ),
-            // lyrics page doesn't support any commands
-            PageType::Lyrics => Ok(false),
-            PageType::Queue => Ok(controller::handle_command_for_queue_page(
-                command,
-                ui.view_mut(),
-                count,
-            )),
-            PageType::CommandHelp => Ok(controller::handle_command_for_command_help_page(
-                command,
-                ui.view_mut(),
-                count,
-            )),
-            PageType::Logs => Ok(controller::handle_command_for_logs_page(
-                command,
-                ui.view_mut(),
-                count,
-            )),
-        },
-        Some(CommandOrAction::Action(action, ActionTarget::SelectedItem)) => match page_type {
-            PageType::Search => anyhow::bail!("page search type should already be handled!"),
-            PageType::Library => {
-                controller::handle_action_for_library_page(action, client_pub, ui.view_mut(), state)
-            }
-            PageType::Context => controller::handle_action_for_focused_context_page(
-                action,
-                client_pub,
-                ui.view_mut(),
-                state,
-            ),
-            PageType::Browse => {
-                controller::handle_action_for_browse_page(action, client_pub, ui.view_mut(), state)
-            }
-            _ => Ok(false),
-        },
+        Some(CommandOrAction::Command(command)) => {
+            handle_command_for_page(command, page_type, client_pub, state, ui)
+        }
+        Some(CommandOrAction::Action(action, ActionTarget::SelectedItem)) => {
+            handle_action_for_page(action, page_type, client_pub, state, ui)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Handles `command` for a page of type `page_type`.
+///
+/// Shared with frontends that run a command without a key press (Tern's `activate`).
+pub fn handle_command_for_page(
+    command: crate::command::Command,
+    page_type: PageType,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut Ctx<'_>,
+) -> Result<bool> {
+    let count = ui.tui.count_prefix;
+    match page_type {
+        PageType::Search => anyhow::bail!("page search type should already be handled!"),
+        PageType::Library => controller::handle_command_for_library_page(
+            command,
+            client_pub,
+            ui.view_mut(),
+            state,
+            count,
+        ),
+        PageType::Context => controller::handle_command_for_context_page(
+            command,
+            client_pub,
+            ui.view_mut(),
+            state,
+            count,
+        ),
+        PageType::Browse => controller::handle_command_for_browse_page(
+            command,
+            client_pub,
+            ui.view_mut(),
+            state,
+            count,
+        ),
+        // lyrics page doesn't support any commands
+        PageType::Lyrics => Ok(false),
+        PageType::Queue => Ok(controller::handle_command_for_queue_page(
+            command,
+            ui.view_mut(),
+            count,
+        )),
+        PageType::CommandHelp => Ok(controller::handle_command_for_command_help_page(
+            command,
+            ui.view_mut(),
+            count,
+        )),
+        PageType::Logs => Ok(controller::handle_command_for_logs_page(
+            command,
+            ui.view_mut(),
+            count,
+        )),
+    }
+}
+
+/// Handles `action` on the selected item of a page of type `page_type`.
+pub fn handle_action_for_page(
+    action: crate::command::Action,
+    page_type: PageType,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut Ctx<'_>,
+) -> Result<bool> {
+    match page_type {
+        PageType::Search => anyhow::bail!("page search type should already be handled!"),
+        PageType::Library => {
+            controller::handle_action_for_library_page(action, client_pub, ui.view_mut(), state)
+        }
+        PageType::Context => controller::handle_action_for_focused_context_page(
+            action,
+            client_pub,
+            ui.view_mut(),
+            state,
+        ),
+        PageType::Browse => {
+            controller::handle_action_for_browse_page(action, client_pub, ui.view_mut(), state)
+        }
         _ => Ok(false),
     }
 }
@@ -102,7 +130,7 @@ fn handle_key_sequence_for_search_page(
     if let SearchFocusState::Input = focus_state {
         if key_sequence.keys.len() == 1 {
             return match &key_sequence.keys[0] {
-                Key::None(crossterm::event::KeyCode::Enter) => {
+                Key::None(KeyCode::Enter) => {
                     if !line_input.is_empty() {
                         *current_query = line_input.text();
                         client_pub.send(ClientRequest::Search(line_input.text()))?;
@@ -117,7 +145,7 @@ fn handle_key_sequence_for_search_page(
         }
     }
 
-    let Some(found_keymap) = crate::frontend_config::get()
+    let Some(found_keymap) = crate::config::get_config()
         .keymap_config
         .find_command_or_action_from_key_sequence(key_sequence)
     else {

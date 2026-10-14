@@ -390,6 +390,7 @@ fn print_features() {
     print_feature!("pixelate");
     print_feature!("notify");
     print_feature!("fzf");
+    print_feature!("tsp");
 
     // Audio backends
     print_feature!("pulseaudio-backend");
