@@ -1,0 +1,633 @@
+const DEFAULT_CONFIG_FOLDER: &str = ".config/spotify-player";
+const DEFAULT_CACHE_FOLDER: &str = ".cache/spotify-player";
+const APP_CONFIG_FILE: &str = "app.toml";
+/// Name of the theme configuration file inside the config folder.
+///
+/// Core does not interpret it; a frontend loads it itself.
+pub const THEME_CONFIG_FILE: &str = "theme.toml";
+/// Name of the keymap configuration file inside the config folder.
+///
+/// Core loads it into [`Configs::keymap_config`], so every frontend binds the user's keys the same.
+pub const KEYMAP_CONFIG_FILE: &str = "keymap.toml";
+
+use anyhow::{anyhow, Result};
+use config_parser2::{config_parser_impl, ConfigParse, ConfigParser};
+use librespot_core::config::SessionConfig;
+use reqwest::Url;
+use serde::{Deserialize, Serialize};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+use anyhow::Context;
+
+use crate::auth::{NCSPOT_CLIENT_ID, SPOTIFY_CLIENT_ID};
+
+static CONFIGS: OnceLock<Configs> = OnceLock::new();
+
+#[derive(Debug)]
+pub struct Configs {
+    pub app_config: AppConfig,
+    /// The user's keybindings ([`KEYMAP_CONFIG_FILE`] plus the defaults), shared by every frontend.
+    pub keymap_config: crate::keymap::KeymapConfig,
+    /// Folder holding the application's configuration files, including the frontend-owned
+    /// [`THEME_CONFIG_FILE`].
+    pub config_folder: std::path::PathBuf,
+    /// Folder holding the application's cache, including fetched cover images.
+    pub cache_folder: std::path::PathBuf,
+}
+
+impl Configs {
+    pub fn new(config_folder: &std::path::Path, cache_folder: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            app_config: AppConfig::new(config_folder)?,
+            keymap_config: crate::keymap::KeymapConfig::new(config_folder)?,
+            config_folder: config_folder.to_path_buf(),
+            cache_folder: cache_folder.to_path_buf(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, ConfigParse)]
+#[allow(clippy::struct_excessive_bools)]
+/// Application configurations
+pub struct AppConfig {
+    pub theme: String,
+    /// The rendering frontend to run: `auto`, `tui` or `tsp`.
+    ///
+    /// The binary interprets it (see its `frontend` module); an unknown value is ignored with a
+    /// warning and `auto` is used.
+    pub frontend: String,
+    pub client_id: String,
+    pub client_id_command: Option<Command>,
+
+    pub client_port: u16,
+
+    pub login_redirect_uri: String,
+
+    pub log_folder: Option<PathBuf>,
+
+    pub player_event_hook_command: Option<Command>,
+
+    pub playback_format: String,
+    pub playback_metadata_fields: Vec<String>,
+    #[cfg(feature = "notify")]
+    pub notify_format: NotifyFormat,
+    #[cfg(feature = "notify")]
+    pub notify_timeout_in_secs: u64,
+    #[cfg(feature = "notify")]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub notify_transient: bool,
+
+    pub tracks_playback_limit: usize,
+
+    // session configs
+    pub proxy: Option<String>,
+    pub ap_port: Option<u16>,
+
+    // duration configs
+    pub app_refresh_duration_in_ms: u64,
+    pub playback_refresh_duration_in_ms: u64,
+
+    pub page_size_in_rows: usize,
+
+    // icon configs
+    pub play_icon: String,
+    pub pause_icon: String,
+    pub liked_icon: String,
+    pub explicit_icon: String,
+
+    // layout configs
+    pub border_type: BorderType,
+    pub progress_bar_type: ProgressBarType,
+    pub progress_bar_position: ProgressBarPosition,
+
+    pub layout: LayoutConfig,
+
+    pub genre_num: u8,
+
+    #[cfg(feature = "image")]
+    pub cover_img_length: usize,
+    #[cfg(feature = "image")]
+    pub cover_img_width: usize,
+    #[cfg(feature = "pixelate")]
+    pub cover_img_pixels: u32,
+
+    #[cfg(feature = "media-control")]
+    pub enable_media_control: bool,
+
+    pub enable_streaming: StreamingType,
+
+    #[cfg(feature = "streaming")]
+    pub enable_audio_visualization: bool,
+
+    #[cfg(feature = "notify")]
+    pub enable_notify: bool,
+
+    pub enable_cover_image_cache: bool,
+
+    pub device: DeviceConfig,
+
+    #[cfg(all(feature = "streaming", feature = "notify"))]
+    pub notify_streaming_only: bool,
+
+    pub seek_duration_secs: u16,
+    pub seek_duration_secs_podcast: u16,
+    pub sort_artist_albums_by_type: bool,
+
+    pub volume_scroll_step: u8,
+    pub enable_mouse_scroll_volume: bool,
+
+    /// Enable app-managed queue for full playlist playback.
+    /// Requires streaming. When disabled, playback uses Spotify-native queue
+    /// management.
+    pub custom_queue: bool,
+
+    pub enable_relative_line_number: bool,
+
+    /// Start the application with playback paused instead of resuming the
+    /// previous session. Requires streaming. When the integrated client
+    /// connects on startup, Spotify may restore and auto-resume the last
+    /// playing track; enabling this pauses that auto-started playback once.
+    #[cfg(feature = "streaming")]
+    pub pause_on_startup: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub enum Position {
+    Top,
+    Bottom,
+}
+config_parser_impl!(Position);
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub enum BorderType {
+    Hidden,
+    Plain,
+    Rounded,
+    Double,
+    Thick,
+}
+config_parser_impl!(BorderType);
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub enum ProgressBarType {
+    Line,
+    Rectangle,
+}
+config_parser_impl!(ProgressBarType);
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub enum ProgressBarPosition {
+    Bottom,
+    Right,
+}
+config_parser_impl!(ProgressBarPosition);
+
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+pub struct Command {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl Command {
+    /// Execute a command, returning stdout if succeeded or stderr if failed
+    pub fn execute(&self, extra_args: Option<Vec<String>>) -> anyhow::Result<String> {
+        let mut args = self.args.clone();
+        args.extend(extra_args.unwrap_or_default());
+
+        let output = std::process::Command::new(&self.command)
+            .args(&args)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = std::str::from_utf8(&output.stderr)?.to_string();
+            anyhow::bail!(stderr);
+        }
+
+        let stdout = std::str::from_utf8(&output.stdout)?.to_string();
+        Ok(stdout)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+/// Application device configurations
+pub struct DeviceConfig {
+    pub name: String,
+    pub device_type: String,
+    pub volume: u8,
+    pub bitrate: u16,
+    pub audio_cache: bool,
+    pub normalization: bool,
+    pub autoplay: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+#[cfg(feature = "notify")]
+pub struct NotifyFormat {
+    pub summary: String,
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+// Application layout configurations
+pub struct LayoutConfig {
+    pub library: LibraryLayoutConfig,
+    pub playback_window_position: Position,
+    pub playback_window_height: usize,
+    pub detail_window_height: usize,
+    pub detail_window_image: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryLayoutKind {
+    /// The default single-axis stack of library windows.
+    Stack,
+    /// A 2x2 quadrant grid of library windows (vertical + horizontal tiling).
+    Grid,
+}
+config_parser_impl!(LibraryLayoutKind);
+
+/// A library window that can be placed in a quadrant of the grid layout.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryView {
+    Playlists,
+    Albums,
+    Artists,
+    Shows,
+}
+config_parser_impl!(LibraryView);
+
+/// Which library window each of the four grid quadrants hosts.
+///
+/// Sizing derives from the per-view `*_percent` fields in [`LibraryLayoutConfig`]: the grid is
+/// split into a top row (top-left + top-right views) and a bottom row, then each row is split
+/// into its two columns proportionally to those views' percents. This lets the vertical divider
+/// differ between the two rows (a dashboard mosaic).
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+pub struct LibraryGridLayoutConfig {
+    pub top_left: LibraryView,
+    pub top_right: LibraryView,
+    pub bottom_left: LibraryView,
+    pub bottom_right: LibraryView,
+}
+
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Deserialize, Serialize, ConfigParse, Clone)]
+pub struct LibraryLayoutConfig {
+    pub layout: LibraryLayoutKind,
+    pub playlist_percent: u16,
+    pub album_percent: u16,
+    pub show_percent: u16,
+    pub audiobook_percent: u16,
+    pub grid: LibraryGridLayoutConfig,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(from = "StreamingTypeOrBool")]
+pub enum StreamingType {
+    Always,
+    DaemonOnly,
+    Never,
+}
+config_parser_impl!(StreamingType);
+
+// For backward compatibility, to accept booleans for enable_streaming
+#[derive(Deserialize)]
+enum RawStreamingType {
+    Always,
+    DaemonOnly,
+    Never,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StreamingTypeOrBool {
+    Bool(bool),
+    Type(RawStreamingType),
+}
+
+impl From<StreamingTypeOrBool> for StreamingType {
+    fn from(v: StreamingTypeOrBool) -> Self {
+        match v {
+            StreamingTypeOrBool::Bool(true)
+            | StreamingTypeOrBool::Type(RawStreamingType::Always) => StreamingType::Always,
+            StreamingTypeOrBool::Bool(false)
+            | StreamingTypeOrBool::Type(RawStreamingType::Never) => StreamingType::Never,
+            StreamingTypeOrBool::Type(RawStreamingType::DaemonOnly) => StreamingType::DaemonOnly,
+        }
+    }
+}
+
+impl Command {
+    pub fn new<C, A>(command: C, args: &[A]) -> Self
+    where
+        C: std::fmt::Display,
+        A: std::fmt::Display,
+    {
+        Self {
+            command: command.to_string(),
+            args: args.iter().map(std::string::ToString::to_string).collect(),
+        }
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            theme: "dracula".to_owned(),
+            frontend: "auto".to_owned(),
+            // Use ncspot's client ID as a fallback for user-provided client ID
+            //
+            // Most of the time, using ncspot's client ID is better than user-provided one
+            // because it is registered with [extended quota mode] and predates [spotify API changes]
+            //
+            // [extended quota mode]: https://developer.spotify.com/documentation/web-api/concepts/quota-modes
+            // [spotify API changes]: https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api
+            client_id: NCSPOT_CLIENT_ID.to_string(),
+            client_id_command: None,
+
+            client_port: 8080,
+
+            login_redirect_uri: "http://127.0.0.1:8989/login".to_string(),
+
+            log_folder: None,
+
+            tracks_playback_limit: 50,
+
+            playback_format: String::from(
+                "{status} {track} • {artists} {liked}\n{album} • {genres}\n{metadata}",
+            ),
+            playback_metadata_fields: vec![
+                "repeat".to_string(),
+                "shuffle".to_string(),
+                "volume".to_string(),
+                "device".to_string(),
+            ],
+            #[cfg(feature = "notify")]
+            notify_format: NotifyFormat {
+                summary: String::from("{track} • {artists}"),
+                body: String::from("{album}"),
+            },
+            #[cfg(feature = "notify")]
+            notify_timeout_in_secs: 0,
+            #[cfg(feature = "notify")]
+            #[cfg(all(unix, not(target_os = "macos")))]
+            notify_transient: false,
+
+            player_event_hook_command: None,
+
+            proxy: None,
+            ap_port: None,
+            app_refresh_duration_in_ms: 32,
+            playback_refresh_duration_in_ms: 0,
+
+            page_size_in_rows: 20,
+
+            pause_icon: "▌▌".to_string(),
+            play_icon: "▶".to_string(),
+            liked_icon: "♥".to_string(),
+            explicit_icon: "(E)".to_string(),
+
+            border_type: BorderType::Plain,
+            progress_bar_type: ProgressBarType::Rectangle,
+            progress_bar_position: ProgressBarPosition::Bottom,
+
+            layout: LayoutConfig::default(),
+
+            genre_num: 2,
+
+            // `0` means "auto": derive the cover's column count from the terminal's cell aspect ratio
+            #[cfg(feature = "image")]
+            cover_img_length: 0,
+            #[cfg(feature = "image")]
+            cover_img_width: 5,
+            #[cfg(feature = "pixelate")]
+            cover_img_pixels: 16,
+
+            // Because of the "creating new window and stealing focus" behaviour
+            // when running the media control event loop on startup,
+            // media control support is disabled by default for Windows and MacOS.
+            // Users will need to explicitly enable this option in their configuration files.
+            #[cfg(feature = "media-control")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            enable_media_control: false,
+            #[cfg(feature = "media-control")]
+            #[cfg(all(unix, not(target_os = "macos")))]
+            enable_media_control: true,
+
+            enable_streaming: StreamingType::Always,
+
+            #[cfg(feature = "streaming")]
+            enable_audio_visualization: false,
+
+            #[cfg(feature = "notify")]
+            enable_notify: true,
+
+            enable_cover_image_cache: true,
+
+            device: DeviceConfig::default(),
+
+            #[cfg(all(feature = "streaming", feature = "notify"))]
+            notify_streaming_only: false,
+
+            seek_duration_secs: 5,
+            seek_duration_secs_podcast: 15,
+            sort_artist_albums_by_type: false,
+
+            volume_scroll_step: 5,
+            enable_mouse_scroll_volume: true,
+
+            custom_queue: true,
+
+            enable_relative_line_number: false,
+
+            #[cfg(feature = "streaming")]
+            pause_on_startup: false,
+        }
+    }
+}
+
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        Self {
+            name: "spotify-player".to_string(),
+            device_type: "speaker".to_string(),
+            volume: 70,
+            bitrate: 320,
+            audio_cache: false,
+            normalization: false,
+            autoplay: false,
+        }
+    }
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            library: LibraryLayoutConfig {
+                layout: LibraryLayoutKind::Stack,
+                playlist_percent: 40,
+                album_percent: 40,
+                show_percent: 0,
+                audiobook_percent: 0,
+                grid: LibraryGridLayoutConfig {
+                    top_left: LibraryView::Playlists,
+                    top_right: LibraryView::Albums,
+                    bottom_left: LibraryView::Artists,
+                    bottom_right: LibraryView::Shows,
+                },
+            },
+            playback_window_position: Position::Top,
+            playback_window_height: 6,
+            detail_window_height: 8,
+            detail_window_image: true,
+        }
+    }
+}
+
+impl LayoutConfig {
+    fn check_values(&self) -> anyhow::Result<()> {
+        if self.library.album_percent
+            + self.library.playlist_percent
+            + self.library.show_percent
+            + self.library.audiobook_percent
+            > 99
+        {
+            anyhow::bail!("Invalid library layout: summation of album_percent, playlist_percent, show_percent, and audiobook_percent cannot be greater than 99!");
+        }
+        Ok(())
+    }
+}
+
+impl AppConfig {
+    pub fn new(path: &Path) -> Result<Self> {
+        let mut config = Self::default();
+        if !config.parse_config_file(path)? {
+            config.write_config_file(path)?;
+        }
+
+        config.layout.check_values()?;
+        Ok(config)
+    }
+
+    // parses configurations from an application config file in `path` folder,
+    // then updates the current configurations accordingly.
+    // returns false if no config file found and true otherwise
+    fn parse_config_file(&mut self, path: &Path) -> Result<bool> {
+        let file_path = path.join(APP_CONFIG_FILE);
+        match std::fs::read_to_string(file_path) {
+            Ok(content) => self
+                .parse(toml::from_str::<toml::Value>(&content)?)
+                .map(|()| true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn write_config_file(&self, path: &Path) -> Result<()> {
+        toml::to_string_pretty(&self)
+            .map_err(From::from)
+            .and_then(|content| {
+                std::fs::write(path.join(APP_CONFIG_FILE), content).map_err(From::from)
+            })
+    }
+
+    #[must_use]
+    pub fn session_config(&self) -> SessionConfig {
+        let proxy = self
+            .proxy
+            .as_ref()
+            .and_then(|proxy| match Url::parse(proxy) {
+                Err(err) => {
+                    tracing::warn!("failed to parse proxy url {proxy}: {err:#}");
+                    None
+                }
+                Ok(url) => Some(url),
+            });
+        SessionConfig {
+            proxy,
+            ap_port: self.ap_port,
+            client_id: SPOTIFY_CLIENT_ID.to_string(),
+            autoplay: Some(self.device.autoplay),
+            ..Default::default()
+        }
+    }
+
+    /// Returns stdout of `client_id_command` if set, otherwise the value of `client_id`.
+    pub fn get_client_id(&self) -> Result<String> {
+        match self.client_id_command {
+            Some(ref cmd) => cmd.execute(None).map(|out| out.trim().to_string()),
+            None => Ok(self.client_id.clone()),
+        }
+    }
+}
+
+/// gets the application's configuration folder path
+pub fn get_config_folder_path() -> Result<PathBuf> {
+    match dirs_next::home_dir() {
+        Some(home) => Ok(home.join(DEFAULT_CONFIG_FOLDER)),
+        None => Err(anyhow!("cannot find the $HOME folder")),
+    }
+}
+
+/// gets the application's cache folder path
+pub fn get_cache_folder_path() -> Result<PathBuf> {
+    match dirs_next::home_dir() {
+        Some(home) => Ok(home.join(DEFAULT_CACHE_FOLDER)),
+        None => Err(anyhow!("cannot find the $HOME folder")),
+    }
+}
+
+/// # Panics
+///
+/// Panics if the configurations have not been set with [`set_config`] yet.
+pub fn get_config() -> &'static Configs {
+    CONFIGS.get().expect("configs is already initialized")
+}
+
+/// # Panics
+///
+/// Panics if the configurations have already been set.
+pub fn set_config(configs: Configs) {
+    CONFIGS
+        .set(configs)
+        .expect("configs should be initialized only once");
+}
+
+// Apply a CLI config override to the application config.
+// Serializes the config to TOML, navigates to the key via dot-notation,
+// overrides the value, and deserializes back into AppConfig.
+// Returns an error if the key path is invalid or the value type mismatches.
+pub fn apply_config_override(config: &mut AppConfig, key: &str, value: &str) -> anyhow::Result<()> {
+    let mut config_value = toml::Value::try_from(&*config)?;
+
+    let parts: Vec<&str> = key.split('.').collect();
+    let mut current = &mut config_value;
+
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            let table = current
+                .as_table_mut()
+                .context(format!("'{key}' is not a valid config path"))?;
+
+            let parsed_value: toml::Value = value
+                .parse()
+                .unwrap_or_else(|_| toml::Value::String(value.to_string()));
+
+            table.insert(part.to_string(), parsed_value);
+        } else {
+            current = current
+                .get_mut(part)
+                .context(format!("Config key '{part}' not found in path '{key}'"))?;
+        }
+    }
+
+    *config = config_value.try_into()?;
+
+    Ok(())
+}

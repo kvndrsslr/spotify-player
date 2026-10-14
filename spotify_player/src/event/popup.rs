@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    controller, page, single_line_input, ActionListItem, AlbumId, ArtistId, ArtistPopupAction,
+    ClientRequest, Command, ContextId, ContextPageType, Ctx, Cursor, Id, Key, KeyCode, KeySequence,
+    PageState, PlayerRequest, PlaylistCreateCurrentField, PlaylistFolderItem, PlaylistId,
+    PlaylistPopupAction, PopupState, Result, SharedState,
+};
 use crate::{
     command::construct_artist_actions, state::ConfirmableAction, utils::filtered_items_from_query,
 };
@@ -8,7 +13,7 @@ pub fn handle_key_sequence_for_popup(
     key_sequence: &KeySequence,
     client_pub: &flume::Sender<ClientRequest>,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) -> Result<bool> {
     // handle popups that need reading the raw key sequence instead of the matched command
     match ui.popup.as_ref().context("empty popup")? {
@@ -45,13 +50,101 @@ pub fn handle_key_sequence_for_popup(
         _ => {}
     }
 
-    let Some(command) = config::get_config()
+    let Some(command) = crate::config::get_config()
         .keymap_config
         .find_command_from_key_sequence(key_sequence)
     else {
         return Ok(false);
     };
 
+    handle_command_for_popup(command, client_pub, state, ui)
+}
+
+/// Runs what Enter does in the currently open popup.
+///
+/// The search, create-playlist, action-list and confirm popups are handled before the command
+/// path — they read raw keys, not commands — so a frontend that has no key press to give (Tern's
+/// `activate`, a click) chooses through here instead. Returns `false` when the popup is one the
+/// command path already covers.
+// the only caller today is the TSP frontend's `activate`
+#[cfg(feature = "tsp")]
+pub fn choose_in_current_popup(
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut Ctx<'_>,
+) -> Result<bool> {
+    // the popup is borrowed immutably to read the choice, then mutated to run it
+    enum Choice {
+        Command,
+        Create { name: String, desc: String },
+        Action(usize),
+        Confirm(ConfirmableAction),
+    }
+
+    let Some(choice) = (match ui.popup.as_ref() {
+        Some(PopupState::Search { .. }) => Some(Choice::Command),
+        Some(PopupState::PlaylistCreate { name, desc, .. }) => Some(Choice::Create {
+            name: name.text(),
+            desc: desc.text(),
+        }),
+        Some(PopupState::ActionList(item, cursor)) => {
+            let index = cursor.selected().unwrap_or(0);
+            (index < item.n_actions()).then_some(Choice::Action(index))
+        }
+        Some(PopupState::ConfirmAction { action, .. }) => Some(Choice::Confirm(action.clone())),
+        _ => None,
+    }) else {
+        return Ok(false);
+    };
+
+    match choice {
+        Choice::Command => {
+            let page_type = ui.current_page().page_type();
+            page::handle_command_for_page(Command::ChooseSelected, page_type, client_pub, state, ui)
+        }
+        Choice::Create { name, desc } => {
+            client_pub.send(ClientRequest::CreatePlaylist {
+                playlist_name: name,
+                public: false,
+                collab: false,
+                desc,
+            })?;
+            ui.popup = None;
+            Ok(true)
+        }
+        Choice::Action(index) => {
+            controller::handle_item_action(index, client_pub, state, ui.view_mut())
+        }
+        Choice::Confirm(action) => {
+            match action {
+                ConfirmableAction::DeleteTrackFromPlaylist {
+                    playlist_id,
+                    track_id,
+                } => {
+                    client_pub.send(ClientRequest::DeleteTrackFromPlaylist(
+                        playlist_id,
+                        track_id,
+                    ))?;
+                }
+                ConfirmableAction::DeleteFromLibrary(item_id) => {
+                    client_pub.send(ClientRequest::DeleteFromLibrary(item_id))?;
+                }
+            }
+            ui.popup = None;
+            Ok(true)
+        }
+    }
+}
+
+/// Handles `command` for the currently open popup.
+///
+/// Shared with frontends that run a command without a key press (Tern's `activate`).
+pub fn handle_command_for_popup(
+    command: crate::command::Command,
+    client_pub: &flume::Sender<ClientRequest>,
+    state: &SharedState,
+    ui: &mut Ctx<'_>,
+) -> Result<bool> {
     match ui.popup.as_ref().context("empty popup")? {
         PopupState::ConfirmAction { .. } => {
             anyhow::bail!("confirm action should be handled before")
@@ -71,7 +164,7 @@ pub fn handle_key_sequence_for_popup(
                 ui,
                 n_items,
                 |_, _| {},
-                |ui: &mut UIStateGuard, id: usize| -> Result<()> {
+                |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
                     let Some(PopupState::ArtistList(action, artists, _)) = &ui.popup else {
                         return Ok(());
                     };
@@ -92,14 +185,14 @@ pub fn handle_key_sequence_for_popup(
                             };
                             ui.popup = Some(PopupState::ActionList(
                                 Box::new(ActionListItem::Artist(artists[id].clone(), actions)),
-                                ListState::default(),
+                                Cursor::default(),
                             ));
                         }
                     }
 
                     Ok(())
                 },
-                |ui: &mut UIStateGuard| {
+                |ui: &mut Ctx<'_>| {
                     ui.popup = None;
                 },
             )
@@ -119,7 +212,7 @@ pub fn handle_key_sequence_for_popup(
                     ui,
                     filtered_items.len(),
                     |_, _| {},
-                    |ui: &mut UIStateGuard, id: usize| -> Result<()> {
+                    |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
                         match filtered_items.get(id).expect("invalid index") {
                             PlaylistFolderItem::Folder(f) => {
                                 ui.popup = Some(PopupState::UserPlaylistList(
@@ -127,7 +220,7 @@ pub fn handle_key_sequence_for_popup(
                                         folder_id: f.target_id,
                                         search_query: search_query.clone(),
                                     },
-                                    ListState::default(),
+                                    Cursor::default(),
                                 ));
                             }
                             PlaylistFolderItem::Playlist(p) => {
@@ -144,7 +237,7 @@ pub fn handle_key_sequence_for_popup(
                         }
                         Ok(())
                     },
-                    |ui: &mut UIStateGuard| {
+                    |ui: &mut Ctx<'_>| {
                         ui.popup = None;
                     },
                 )
@@ -165,7 +258,7 @@ pub fn handle_key_sequence_for_popup(
                     ui,
                     filtered_items.len(),
                     |_, _| {},
-                    |ui: &mut UIStateGuard, id: usize| -> Result<()> {
+                    |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
                         ui.popup = match filtered_items.get(id).expect("invalid index") {
                             PlaylistFolderItem::Folder(f) => Some(PopupState::UserPlaylistList(
                                 PlaylistPopupAction::AddTrack {
@@ -173,7 +266,7 @@ pub fn handle_key_sequence_for_popup(
                                     track_id,
                                     search_query: search_query.clone(),
                                 },
-                                ListState::default(),
+                                Cursor::default(),
                             )),
                             PlaylistFolderItem::Playlist(p) => {
                                 client_pub.send(ClientRequest::AddPlayableToPlaylist(
@@ -185,7 +278,7 @@ pub fn handle_key_sequence_for_popup(
                         };
                         Ok(())
                     },
-                    |ui: &mut UIStateGuard| {
+                    |ui: &mut Ctx<'_>| {
                         ui.popup = None;
                     },
                 )
@@ -206,7 +299,7 @@ pub fn handle_key_sequence_for_popup(
                     ui,
                     filtered_items.len(),
                     |_, _| {},
-                    |ui: &mut UIStateGuard, id: usize| -> Result<()> {
+                    |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
                         ui.popup = match filtered_items.get(id).expect("invalid index") {
                             PlaylistFolderItem::Folder(f) => Some(PopupState::UserPlaylistList(
                                 PlaylistPopupAction::AddEpisode {
@@ -214,7 +307,7 @@ pub fn handle_key_sequence_for_popup(
                                     episode_id,
                                     search_query: search_query.clone(),
                                 },
-                                ListState::default(),
+                                Cursor::default(),
                             )),
                             PlaylistFolderItem::Playlist(p) => {
                                 client_pub.send(ClientRequest::AddPlayableToPlaylist(
@@ -226,7 +319,7 @@ pub fn handle_key_sequence_for_popup(
                         };
                         Ok(())
                     },
-                    |ui: &mut UIStateGuard| {
+                    |ui: &mut Ctx<'_>| {
                         ui.popup = None;
                     },
                 )
@@ -273,21 +366,31 @@ pub fn handle_key_sequence_for_popup(
                 command,
                 ui,
                 n_items,
-                |ui: &mut UIStateGuard, id: usize| {
-                    ui.theme = match ui.popup {
-                        Some(PopupState::ThemeList(ref themes, _)) => themes[id].clone(),
-                        _ => return,
+                |ui: &mut Ctx<'_>, id: usize| {
+                    let Some(PopupState::ThemeList(ref themes, _)) = ui.popup else {
+                        return;
                     };
+                    if let Some(theme) = crate::frontend_config::get()
+                        .theme_config
+                        .find_theme(&themes[id])
+                    {
+                        ui.tui.theme = theme;
+                    }
                 },
-                |ui: &mut UIStateGuard, _| -> Result<()> {
+                |ui: &mut Ctx<'_>, _| -> Result<()> {
                     ui.popup = None;
                     Ok(())
                 },
-                |ui: &mut UIStateGuard| {
-                    ui.theme = match ui.popup {
-                        Some(PopupState::ThemeList(ref themes, _)) => themes[0].clone(),
-                        _ => return,
+                |ui: &mut Ctx<'_>| {
+                    let Some(PopupState::ThemeList(ref themes, _)) = ui.popup else {
+                        return;
                     };
+                    if let Some(theme) = crate::frontend_config::get()
+                        .theme_config
+                        .find_theme(&themes[0])
+                    {
+                        ui.tui.theme = theme;
+                    }
                     ui.popup = None;
                 },
             )
@@ -300,7 +403,7 @@ pub fn handle_key_sequence_for_popup(
                 ui,
                 player.devices.len(),
                 |_, _| {},
-                |ui: &mut UIStateGuard, id: usize| -> Result<()> {
+                |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
                     let is_playing = player.playback.as_ref().is_some_and(|p| p.is_playing);
                     client_pub.send(ClientRequest::Player(PlayerRequest::TransferPlayback(
                         player.devices[id].id.clone(),
@@ -309,7 +412,7 @@ pub fn handle_key_sequence_for_popup(
                     ui.popup = None;
                     Ok(())
                 },
-                |ui: &mut UIStateGuard| {
+                |ui: &mut Ctx<'_>| {
                     ui.popup = None;
                 },
             )
@@ -320,7 +423,7 @@ pub fn handle_key_sequence_for_popup(
 fn handle_key_sequence_for_create_playlist_popup(
     key_sequence: &KeySequence,
     client_pub: &flume::Sender<ClientRequest>,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) -> Result<bool> {
     let Some(PopupState::PlaylistCreate {
         name,
@@ -332,17 +435,17 @@ fn handle_key_sequence_for_create_playlist_popup(
     };
     if key_sequence.keys.len() == 1 {
         match &key_sequence.keys[0] {
-            Key::None(crossterm::event::KeyCode::Enter) => {
+            Key::None(KeyCode::Enter) => {
                 client_pub.send(ClientRequest::CreatePlaylist {
-                    playlist_name: name.get_text(),
+                    playlist_name: name.text(),
                     public: false,
                     collab: false,
-                    desc: desc.get_text(),
+                    desc: desc.text(),
                 })?;
                 ui.popup = None;
                 return Ok(true);
             }
-            Key::None(crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::BackTab) => {
+            Key::None(KeyCode::Tab | KeyCode::BackTab) => {
                 *current_field = match &current_field {
                     PlaylistCreateCurrentField::Name => PlaylistCreateCurrentField::Desc,
                     PlaylistCreateCurrentField::Desc => PlaylistCreateCurrentField::Name,
@@ -354,7 +457,7 @@ fn handle_key_sequence_for_create_playlist_popup(
                     PlaylistCreateCurrentField::Name => name,
                     PlaylistCreateCurrentField::Desc => desc,
                 };
-                if line_input.input(k).is_some() {
+                if single_line_input::handle_key(line_input, k).is_some() {
                     return Ok(true);
                 }
             }
@@ -367,7 +470,7 @@ fn handle_key_sequence_for_search_popup(
     key_sequence: &KeySequence,
     client_pub: &flume::Sender<ClientRequest>,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) -> Result<bool> {
     // handle user's input that updates the search query
     let Some(PopupState::Search { ref mut query }) = &mut ui.popup else {
@@ -376,12 +479,12 @@ fn handle_key_sequence_for_search_popup(
     if key_sequence.keys.len() == 1 {
         if let Key::None(c) = key_sequence.keys[0] {
             match c {
-                crossterm::event::KeyCode::Char(c) => {
+                KeyCode::Char(c) => {
                     query.push(c);
                     ui.current_page_mut().select(0);
                     return Ok(true);
                 }
-                crossterm::event::KeyCode::Backspace => {
+                KeyCode::Backspace => {
                     if query.is_empty() {
                         // close search popup when user presses backspace on empty search
                         ui.popup = None;
@@ -409,7 +512,7 @@ fn handle_key_sequence_for_search_popup(
 /// - `uri_type`: an enum represents the type of a context in the list (`playlist`, `artist`, etc)
 fn handle_command_for_context_browsing_list_popup(
     command: Command,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     uris: &[String],
     context_type: &rspotify::model::Type,
 ) -> Result<bool> {
@@ -418,7 +521,7 @@ fn handle_command_for_context_browsing_list_popup(
         ui,
         uris.len(),
         |_, _| {},
-        |ui: &mut UIStateGuard, id: usize| -> Result<()> {
+        |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
             let uri = crate::utils::parse_uri(&uris[id]);
             let context_id = match context_type {
                 rspotify::model::Type::Playlist => {
@@ -443,7 +546,7 @@ fn handle_command_for_context_browsing_list_popup(
 
             Ok(())
         },
-        |ui: &mut UIStateGuard| {
+        |ui: &mut Ctx<'_>| {
             ui.popup = None;
         },
     )
@@ -458,13 +561,13 @@ fn handle_command_for_context_browsing_list_popup(
 /// - `on_close_func`: the callback when closing the popup
 fn handle_command_for_list_popup(
     command: Command,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     n_items: usize,
-    on_select_func: impl FnOnce(&mut UIStateGuard, usize),
-    on_choose_func: impl FnOnce(&mut UIStateGuard, usize) -> anyhow::Result<()>,
-    on_close_func: impl FnOnce(&mut UIStateGuard),
+    on_select_func: impl FnOnce(&mut Ctx<'_>, usize),
+    on_choose_func: impl FnOnce(&mut Ctx<'_>, usize) -> anyhow::Result<()>,
+    on_close_func: impl FnOnce(&mut Ctx<'_>),
 ) -> anyhow::Result<bool> {
-    let offset = ui.count_prefix.unwrap_or(1);
+    let offset = ui.tui.count_prefix.unwrap_or(1);
     let popup = ui.popup.as_mut().with_context(|| "expect a popup")?;
     let current_id = popup.list_selected().unwrap_or_default();
 
@@ -501,19 +604,19 @@ fn handle_key_sequence_for_action_list_popup(
     key_sequence: &KeySequence,
     client_pub: &flume::Sender<ClientRequest>,
     state: &SharedState,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) -> Result<bool> {
-    if let Some(Key::None(crossterm::event::KeyCode::Char(c))) = key_sequence.keys.first() {
+    if let Some(Key::None(KeyCode::Char(c))) = key_sequence.keys.first() {
         if let Some(id) = c.to_digit(10) {
             let id = id as usize;
             if id < n_actions {
-                handle_item_action(id, client_pub, state, ui)?;
+                controller::handle_item_action(id, client_pub, state, ui.view_mut())?;
                 return Ok(true);
             }
         }
     }
 
-    let Some(command) = config::get_config()
+    let Some(command) = crate::config::get_config()
         .keymap_config
         .find_command_from_key_sequence(key_sequence)
     else {
@@ -525,56 +628,20 @@ fn handle_key_sequence_for_action_list_popup(
         ui,
         n_actions,
         |_, _| {},
-        |ui: &mut UIStateGuard, id: usize| -> Result<()> {
-            handle_item_action(id, client_pub, state, ui)?;
+        |ui: &mut Ctx<'_>, id: usize| -> Result<()> {
+            controller::handle_item_action(id, client_pub, state, ui.view_mut())?;
             Ok(())
         },
-        |ui: &mut UIStateGuard| {
+        |ui: &mut Ctx<'_>| {
             ui.popup = None;
         },
     )
 }
 
-/// Handle the `n`-th action in an action list popup
-pub fn handle_item_action(
-    n: usize,
-    client_pub: &flume::Sender<ClientRequest>,
-    state: &SharedState,
-    ui: &mut UIStateGuard,
-) -> Result<bool> {
-    let item = match ui.popup {
-        Some(PopupState::ActionList(ref item, ..)) => *item.clone(),
-        _ => return Ok(false),
-    };
-
-    let data = state.data.read();
-
-    match item {
-        ActionListItem::Track(track, actions) => {
-            handle_action_in_context(actions[n], track.into(), client_pub, &data, ui)
-        }
-        ActionListItem::Album(album, actions) => {
-            handle_action_in_context(actions[n], album.into(), client_pub, &data, ui)
-        }
-        ActionListItem::Artist(artist, actions) => {
-            handle_action_in_context(actions[n], artist.into(), client_pub, &data, ui)
-        }
-        ActionListItem::Playlist(playlist, actions) => {
-            handle_action_in_context(actions[n], playlist.into(), client_pub, &data, ui)
-        }
-        ActionListItem::Show(show, actions) => {
-            handle_action_in_context(actions[n], show.into(), client_pub, &data, ui)
-        }
-        ActionListItem::Episode(episode, actions) => {
-            handle_action_in_context(actions[n], episode.into(), client_pub, &data, ui)
-        }
-    }
-}
-
 /// Handle key sequence for playlist search popup (AddTrack/AddEpisode)
 fn handle_key_sequence_for_playlist_search_popup(
     key_sequence: &KeySequence,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
 ) -> bool {
     // Handle user's input that updates the search query
     let Some(PopupState::UserPlaylistList(ref mut action, _)) = &mut ui.popup else {
@@ -590,7 +657,7 @@ fn handle_key_sequence_for_playlist_search_popup(
     if key_sequence.keys.len() == 1 {
         if let Key::None(c) = key_sequence.keys[0] {
             match c {
-                crossterm::event::KeyCode::Char(c) => {
+                KeyCode::Char(c) => {
                     search_query.push(c);
                     // Reset selection to first item when search query changes
                     if let Some(popup) = &mut ui.popup {
@@ -598,7 +665,7 @@ fn handle_key_sequence_for_playlist_search_popup(
                     }
                     return true;
                 }
-                crossterm::event::KeyCode::Backspace => {
+                KeyCode::Backspace => {
                     if search_query.is_empty() {
                         // Close playlist popup when user presses backspace on empty search
                         ui.popup = None;
@@ -622,12 +689,12 @@ fn handle_key_sequence_for_playlist_search_popup(
 fn handle_key_sequence_for_confirm_popup(
     key_sequence: &KeySequence,
     client_pub: &flume::Sender<ClientRequest>,
-    ui: &mut UIStateGuard,
+    ui: &mut Ctx<'_>,
     action: ConfirmableAction,
 ) -> Result<bool> {
     if matches!(
         key_sequence.keys.as_slice(),
-        [Key::None(crossterm::event::KeyCode::Char('y'))]
+        [Key::None(KeyCode::Char('y'))]
     ) {
         match action {
             ConfirmableAction::DeleteTrackFromPlaylist {

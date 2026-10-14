@@ -1,208 +1,60 @@
-mod auth;
 mod cli;
-mod client;
-mod command;
-mod config;
 mod event;
-mod key;
-mod log_layer;
-#[cfg(feature = "media-control")]
-mod media_control;
-mod playlist_folders;
-mod state;
-#[cfg(feature = "streaming")]
-mod streaming;
-mod token;
+mod frontend;
+mod frontend_config;
+mod theme;
 mod ui;
-mod utils;
+
+// The core crate owns the model, state, client, configuration and command execution.
+// Re-exporting its modules keeps the frontend's `crate::…` paths unchanged.
+#[cfg(feature = "media-control")]
+use spotify_player_core::media_control;
+#[cfg(feature = "streaming")]
+use spotify_player_core::visualization;
+use spotify_player_core::{
+    auth, client, command, config, controller, key, playback, runtime, state, utils,
+};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use std::{collections::VecDeque, io::Write, sync::Arc};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::config::apply_config_override;
 
-fn init_logging(
-    log_folder: &std::path::Path,
-    log_buffer: Arc<Mutex<VecDeque<String>>>,
-) -> Result<()> {
-    if std::env::var_os("RUST_LOG").is_some_and(|x| x == "off") {
-        // Don't create log files if logging is disabled.
-        return Ok(());
-    }
-
-    let log_prefix = format!(
-        "spotify-player-{}",
-        chrono::Local::now().format("%y-%m-%d-%H-%M")
-    );
-
-    // initialize the application's logging
-    if std::env::var("RUST_LOG").is_err() {
-        // default to log the current crate and librespot crates
-        std::env::set_var("RUST_LOG", "spotify_player=info,librespot=info");
-    }
-    if !log_folder.exists() {
-        std::fs::create_dir_all(log_folder)?;
-    }
-    let log_file = std::fs::File::create(log_folder.join(format!("{log_prefix}.log")))
-        .context("failed to create log file")?;
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(log_file));
-
-    let buffer_layer = crate::log_layer::BufferLayer::new(log_buffer, 1000);
-
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(fmt_layer)
-        .with(buffer_layer)
-        .init();
-
-    // initialize the application's panic backtrace
-    let backtrace_file = std::fs::File::create(log_folder.join(format!("{log_prefix}.backtrace")))
-        .context("failed to create backtrace file")?;
-    let backtrace_file = std::sync::Mutex::new(backtrace_file);
-    std::panic::set_hook(Box::new(move |info| {
-        let mut file = backtrace_file.lock().unwrap();
-        let backtrace = backtrace::Backtrace::new();
-        writeln!(&mut file, "Got a panic: {info:#?}\n").unwrap();
-        writeln!(&mut file, "Stack backtrace:\n{backtrace:?}").unwrap();
-    }));
-
-    Ok(())
-}
-
 #[tokio::main]
-async fn start_app(state: &state::SharedState) -> Result<()> {
-    // client channels
-    let (client_pub, client_sub) = flume::unbounded::<client::ClientRequest>();
-
-    #[cfg(feature = "pulseaudio-backend")]
-    {
-        // set environment variables for PulseAudio
-        if std::env::var("PULSE_PROP_application.name").is_err() {
-            std::env::set_var("PULSE_PROP_application.name", "spotify-player");
-        }
-        if std::env::var("PULSE_PROP_application.icon_name").is_err() {
-            std::env::set_var("PULSE_PROP_application.icon_name", "spotify");
-        }
-        if std::env::var("PULSE_PROP_stream.description").is_err() {
-            let configs = config::get_config();
-            std::env::set_var(
-                "PULSE_PROP_stream.description",
-                format!(
-                    "Spotify Connect endpoint ({})",
-                    configs.app_config.device.name
-                ),
-            );
-        }
-        if std::env::var("PULSE_PROP_media.software").is_err() {
-            std::env::set_var("PULSE_PROP_media.software", "Spotify");
-        }
-        if std::env::var("PULSE_PROP_media.role").is_err() {
-            std::env::set_var("PULSE_PROP_media.role", "music");
-        }
-    }
-
-    // create a Spotify API client
-    let client = client::AppClient::new()
+async fn start_app(
+    state: &state::SharedState,
+    requested_frontend: Option<frontend::FrontendKind>,
+) -> Result<()> {
+    let runtime = runtime::start(state)
         .await
-        .context("construct app client")?;
-    client
-        .new_session(Some(state), true)
-        .await
-        .context("initialize new Spotify session")?;
+        .context("start the application runtime")?;
 
-    // request user data
-    client_pub.send(client::ClientRequest::GetCurrentUser)?;
-    client_pub.send(client::ClientRequest::GetUserPlaylists)?;
-    client_pub.send(client::ClientRequest::GetUserFollowedArtists)?;
-    client_pub.send(client::ClientRequest::GetUserSavedAlbums)?;
-    client_pub.send(client::ClientRequest::GetContext(state::ContextId::Tracks(
-        state::USER_LIKED_TRACKS_ID.to_owned(),
-    )))?;
-    client_pub.send(client::ClientRequest::GetUserSavedShows)?;
+    // Now that the client is up (and any first-run authentication is over, which needs the
+    // terminal to itself), pick the frontend that can actually run here: this is where TSP's
+    // handshake probes the terminal. A daemon renders nothing, so it has no frontend.
+    let frontend = match requested_frontend {
+        None => None,
+        Some(requested) => Some(frontend::select(requested)?),
+    };
 
     // client socket task (for handling CLI commands)
     tokio::task::spawn({
-        let client = client.clone();
+        let client = runtime.client.clone();
         let state = state.clone();
         async move {
             cli::start_socket(&client, Some(&state), None).await;
         }
     });
-    // client event handler task
-    tokio::task::spawn({
-        let state = state.clone();
-        let client = client.clone();
-        async move {
-            client::start_client_handler(&state, &client, &client_sub).await;
-        }
-    });
 
-    // background task that detects an invalidated session and reconnects,
-    // independent of any incoming client request
-    tokio::task::spawn({
-        let state = state.clone();
-        let client = client.clone();
-        async move {
-            client::start_session_watcher(state, client).await;
-        }
-    });
-
-    #[cfg(feature = "image")]
-    // background task that refetches cover images the UI reported missing from cache
-    // (e.g. evicted while browsing long shows), with exponential backoff per url
-    tokio::task::spawn({
-        let client = client.clone();
-        let state = state.clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                client.recover_missing_images(&state);
-            }
-        }
-    });
-
-    // player event watcher task
-    std::thread::Builder::new()
-        .name("player-event-watcher".to_string())
-        .spawn({
-            let state = state.clone();
-            let client_pub = client_pub.clone();
-            move || {
-                client::start_player_event_watcher(&state, &client_pub);
-            }
-        })?;
-
-    if !state.is_daemon {
-        // The image picker must run before the terminal is set up: it queries the terminal on
-        // stdin and has to clean up after a query that is never answered before `init_terminal`
-        // reads a cursor position. See `ui::init_image_picker`.
-        #[cfg(feature = "image")]
-        ui::init_image_picker(state).context("initialize image picker")?;
-        let terminal = ui::init_terminal().context("initialize terminal")?;
-
-        // terminal event handler task
-        std::thread::Builder::new()
-            .name("terminal-event-handler".to_string())
-            .spawn({
-                let client_pub = client_pub.clone();
-                let state = state.clone();
-                move || {
-                    event::start_event_handler(&state, &client_pub);
-                }
-            })?;
-
-        // application UI task
-        std::thread::Builder::new().name("ui".to_string()).spawn({
-            let state = state.clone();
-            move || ui::run(&state, terminal)
-        })?;
+    if let Some(frontend) = frontend {
+        frontend::start(
+            frontend,
+            &frontend::FrontendContext {
+                state: state.clone(),
+                client_tx: runtime.client_tx.clone(),
+            },
+        )?;
     }
 
     #[cfg(feature = "media-control")]
@@ -212,8 +64,9 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
             .name("media-control".to_string())
             .spawn({
                 let state = state.clone();
+                let client_tx = runtime.client_tx.clone();
                 move || {
-                    if let Err(err) = media_control::start_event_watcher(&state, client_pub) {
+                    if let Err(err) = media_control::start_event_watcher(&state, client_tx) {
                         tracing::error!(
                             "Failed to start the application's media control event watcher: err={err:#?}"
                         );
@@ -292,6 +145,13 @@ fn main() -> Result<()> {
         config::set_config(configs);
     }
 
+    // initialize the frontend (theme) config
+    frontend_config::set(frontend_config::FrontendConfigs::new(&config_folder)?);
+
+    // the frontend the command line asks for, if any; `app.toml`'s `frontend` option and `auto`
+    // are resolved once the configuration is loaded
+    let requested_frontend = args.get_one::<String>("frontend").map(String::as_str);
+
     match args.subcommand() {
         None => {
             // initialize the application's log
@@ -304,7 +164,7 @@ fn main() -> Result<()> {
             let log_buffer: Arc<Mutex<VecDeque<String>>> =
                 Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
 
-            init_logging(log_folder, log_buffer.clone())
+            runtime::init_logging(log_folder, log_buffer.clone())
                 .context("failed to initialize application's logging")?;
 
             // log the application's configurations
@@ -334,8 +194,20 @@ fn main() -> Result<()> {
                 is_daemon = false;
             }
 
+            // Resolve which frontend to run before the client and the socket server start: an
+            // unknown `--frontend`, or a frontend this build does not have, fails immediately. A
+            // daemon renders nothing, so it has no frontend.
+            let frontend = if is_daemon {
+                None
+            } else {
+                Some(frontend::resolve(
+                    requested_frontend,
+                    &config::get_config().app_config.frontend,
+                )?)
+            };
+
             let state = std::sync::Arc::new(state::State::new(is_daemon, log_buffer));
-            start_app(&state)
+            start_app(&state, frontend)
         }
         Some((cmd, args)) => cli::handle_cli_subcommand(cmd, args),
     }

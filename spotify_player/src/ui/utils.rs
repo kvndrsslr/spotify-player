@@ -1,8 +1,7 @@
 use super::{
-    config, Block, BorderType, Borders, Frame, List, ListItem, ListState, Rect, Span, Style, Table,
-    TableState,
+    config, Block, BorderType, Borders, Cursor, Frame, List, ListItem, ListState, Rect, Span,
+    Style, Table, TableState,
 };
-use unicode_bidi::BidiInfo;
 
 /// Construct and render a block.
 ///
@@ -10,7 +9,7 @@ use unicode_bidi::BidiInfo;
 /// It returns the rectangle to render the inner widgets inside the block.
 pub fn construct_and_render_block(
     title: &str,
-    theme: &config::Theme,
+    theme: &crate::theme::Theme,
     borders: Borders,
     frame: &mut Frame,
     rect: Rect,
@@ -52,7 +51,7 @@ pub fn construct_and_render_block(
 
 /// Construct a generic list widget
 pub fn construct_list_widget<'a>(
-    theme: &config::Theme,
+    theme: &crate::theme::Theme,
     items: Vec<(String, bool)>,
     is_active: bool,
     selected_index: Option<usize>,
@@ -90,14 +89,14 @@ pub fn construct_list_widget<'a>(
     )
 }
 
-/// adjust the `selected` position of a `ListState` if that position is invalid
-fn adjust_list_state(state: &mut ListState, len: usize) {
-    if let Some(p) = state.selected() {
+/// Adjust the `selected` position of a cursor if that position is invalid
+fn adjust_cursor(cursor: &mut Cursor, len: usize) {
+    if let Some(p) = cursor.selected() {
         if p >= len {
-            state.select(if len > 0 { Some(len - 1) } else { Some(0) });
+            cursor.select(if len > 0 { Some(len - 1) } else { Some(0) });
         }
     } else if len > 0 {
-        state.select(Some(0));
+        cursor.select(Some(0));
     }
 }
 
@@ -106,21 +105,17 @@ pub fn render_list_window(
     widget: List,
     rect: Rect,
     len: usize,
-    state: &mut ListState,
+    cursor: &mut Cursor,
 ) {
-    adjust_list_state(state, len);
-    frame.render_stateful_widget(widget, rect, state);
-}
-
-/// adjust the `selected` position of a `TableState` if that position is invalid
-fn adjust_table_state(state: &mut TableState, len: usize) {
-    if let Some(p) = state.selected() {
-        if p >= len {
-            state.select(if len > 0 { Some(len - 1) } else { Some(0) });
-        }
-    } else if len > 0 {
-        state.select(Some(0));
-    }
+    adjust_cursor(cursor, len);
+    // ratatui keeps the scroll offset inside its own widget state; bridge the cursor in and
+    // back out so the view model stays free of rendering types.
+    let mut state = ListState::default();
+    state.select(cursor.selected());
+    *state.offset_mut() = cursor.offset;
+    frame.render_stateful_widget(widget, rect, &mut state);
+    cursor.selected = state.selected();
+    cursor.offset = state.offset();
 }
 
 pub fn render_table_window(
@@ -128,51 +123,13 @@ pub fn render_table_window(
     widget: Table,
     rect: Rect,
     len: usize,
-    state: &mut TableState,
+    cursor: &mut Cursor,
 ) {
-    adjust_table_state(state, len);
-    frame.render_stateful_widget(widget, rect, state);
-}
-
-/// Convert a string to a bidirectional string.
-/// Used to handle RTL text properly in the UI.
-pub fn to_bidi_string(s: &str) -> String {
-    let bidi_info = BidiInfo::new(s, None);
-
-    let bidi_string = if bidi_info.has_rtl() && !bidi_info.paragraphs.is_empty() {
-        bidi_info
-            .reorder_line(&bidi_info.paragraphs[0], 0..s.len())
-            .into_owned()
-    } else {
-        s.to_string()
-    };
-
-    bidi_string
-}
-
-/// formats genres depending on the number of genres and `genre_num`
-///
-/// Examples for `genre_num = 2`
-/// - 1 genre: "genre1"
-/// - 2 genres: "genre1, genre2"
-/// - \>= 3 genres: "genre1, genre2, ..."
-pub fn format_genres(genres: &[String], genre_num: u8) -> String {
-    let mut genre_str = String::with_capacity(64);
-
-    if genre_num > 0 {
-        for i in 0..genres.len() {
-            genre_str.push_str(&genres[i]);
-
-            if i + 1 != genres.len() {
-                genre_str.push_str(", ");
-
-                if i + 1 >= genre_num as usize {
-                    genre_str.push_str("...");
-                    break;
-                }
-            }
-        }
-    }
-
-    genre_str
+    adjust_cursor(cursor, len);
+    let mut state = TableState::default();
+    state.select(cursor.selected());
+    *state.offset_mut() = cursor.offset;
+    frame.render_stateful_widget(widget, rect, &mut state);
+    cursor.selected = state.selected();
+    cursor.offset = state.offset();
 }

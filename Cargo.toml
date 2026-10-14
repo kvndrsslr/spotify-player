@@ -1,5 +1,5 @@
 [workspace]
-members = ["spotify_player"]
+members = ["spotify_player", "crates/core"]
 resolver = "2"
 
 [profile.release]

@@ -209,6 +209,13 @@ pub fn init_cli() -> anyhow::Result<clap::Command> {
                 .value_name("KEY=VALUE")
                 .action(clap::ArgAction::Append)
                 .help("Override a config option (e.g. -o device.volume=80 -o theme=dracula)"),
+        )
+        .arg(
+            clap::Arg::new("frontend")
+                .short('f')
+                .long("frontend")
+                .value_name("FRONTEND")
+                .help("Rendering frontend to use: auto (default), tui or tsp"),
         );
 
     #[cfg(feature = "daemon")]

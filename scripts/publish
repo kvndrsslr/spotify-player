@@ -8,4 +8,16 @@ crate="${1:-spotify_player}"
 
 git checkout master && git fetch && git merge origin/master
 
-cd $crate && cargo publish
+# `spotify_player` depends on `spotify_player_core`, so publishing the binary crate publishes
+# the core crate first. Either the package name or the crate directory can be passed.
+if [ "$crate" = "spotify_player" ]; then
+  dirs=(crates/core spotify_player)
+elif [ "$crate" = "spotify_player_core" ] || [ "$crate" = "core" ]; then
+  dirs=(crates/core)
+else
+  dirs=("$crate")
+fi
+
+for dir in "${dirs[@]}"; do
+  (cd "$dir" && cargo publish)
+done
