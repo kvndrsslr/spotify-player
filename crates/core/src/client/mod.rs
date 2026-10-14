@@ -1745,7 +1745,7 @@ impl AppClient {
                         m.mute_state = None;
                     },
                 );
-                state.ui.lock().volume_target = None;
+                *state.volume_target.lock() = None;
                 true
             }
             PlayerRequest::ToggleMute => {

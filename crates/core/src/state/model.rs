@@ -383,7 +383,6 @@ impl Track {
         }
     }
 
-
     /// tries to convert from a `rspotify::model::FullTrack` into `Track` with a optional `added_at` date
     fn try_from_full_track_with_date(
         track: rspotify::model::FullTrack,
@@ -413,7 +412,6 @@ impl Track {
     pub fn try_from_full_track(track: rspotify::model::FullTrack) -> Option<Self> {
         Track::try_from_full_track_with_date(track, None)
     }
-
 }
 
 impl std::fmt::Display for Track {
