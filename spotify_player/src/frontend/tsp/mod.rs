@@ -165,7 +165,13 @@ fn turn(
         session.send(surface, ops).context("send frame ops")?;
     }
 
-    // input wakes this immediately; the timeout is when the view is re-rendered
+    // Input wakes this immediately; the timeout is when the view is re-rendered.
+    //
+    // Unlike the TUI, this frontend cannot await the core redraw signal: `Session::next` blocks
+    // in a read on the session's pty with no cross-thread waker (tern-sdk `session.rs::next` ->
+    // `read`, both `&mut self`), so a signal raised by a background task could not interrupt it.
+    // Polling at `app_refresh_duration_in_ms` is therefore still how a change made elsewhere
+    // reaches the surface.
     match session.next(Some(refresh)).context("read the terminal")? {
         Some(Input::Key(key)) => {
             keys::handle(&key, state, &mut session_state.ui_state, client_tx)?;

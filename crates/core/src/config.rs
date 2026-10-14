@@ -87,6 +87,9 @@ pub struct AppConfig {
     pub ap_port: Option<u16>,
 
     // duration configs
+    /// Cadence of the views that move on their own — the audio visualizer's frames, the startup
+    /// spinner's animation. It is no longer how often the application redraws: a frontend is
+    /// reactive and draws when something changed (see `state::RedrawNotify`).
     pub app_refresh_duration_in_ms: u64,
     pub playback_refresh_duration_in_ms: u64,
 

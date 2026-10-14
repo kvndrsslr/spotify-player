@@ -203,6 +203,33 @@ impl ImageCompositor {
             Encoded::Iterm2 { .. } => reserve_area(frame, area),
         }
     }
+
+    /// When this compositor next owes a render for a reason no state change announces: a target
+    /// change still waiting out [`URL_SETTLE_WINDOW`] (its deferred encode lands only on a later
+    /// render), or a surface on screen whose grid-anchored pixels need the
+    /// [`TRANSMIT_REFRESH_INTERVAL`] backstop.
+    ///
+    /// `None` when nothing is pending. Only a slot drawn in the most recent frame needs the
+    /// backstop — one that is off screen now heals through the skipped-frame path when it
+    /// renders again — so a buttoned-up page costs no timer at all.
+    pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        let mut due = |at: Instant| earliest = Some(earliest.map_or(at, |e| e.min(at)));
+
+        for slot in self.slots.values() {
+            let surface = &slot.surface;
+            let target_changed = slot.requested_url.as_deref() != Some(surface.url.as_str())
+                || slot.requested_area != Some(surface.area);
+            if target_changed {
+                due(slot.last_change.unwrap_or(now) + URL_SETTLE_WINDOW);
+            }
+            if surface.last_frame == self.epoch && surface.scheduled() {
+                due(surface.last_emitted + TRANSMIT_REFRESH_INTERVAL);
+            }
+        }
+
+        earliest
+    }
 }
 
 impl Surface {

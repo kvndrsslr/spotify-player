@@ -23,6 +23,7 @@ use ratatui::{
     },
     Frame,
 };
+use std::time::{Duration, Instant};
 
 type Terminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
@@ -38,18 +39,76 @@ mod state;
 pub mod streaming;
 pub mod utils;
 
-/// Run the application UI
+/// Longest the loop waits with nothing due.
+///
+/// A raise that never arrives — a producer path missed, a frontend-side mutation with no owner —
+/// must not freeze the UI forever, so every wait is bounded by this. One frame per interval is
+/// 0.0x% of a core, negligible next to the frames the loop no longer draws.
+const MAX_IDLE_WAIT: Duration = Duration::from_secs(10);
+
+/// Elapsed-time refresh while a track plays: the progress bar, the lyrics highlight and the
+/// playback clock are computed from a stored position plus wall-clock time, so they need a tick
+/// even when nothing changes state.
+const PLAYBACK_REFRESH: Duration = Duration::from_secs(1);
+
+/// Refresh while the first playback fetch is still outstanding, matching the 100ms step the
+/// "Loading..." spinner's glyphs advance on.
+const SPINNER_REFRESH: Duration = Duration::from_millis(100);
+
+/// How long to wait after a failed draw before trying again. A terminal that is momentarily gone
+/// (a detached multiplexer, a closed pty) fails every draw; retrying hot would spin a core.
+const DRAW_FAILURE_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Run the application UI.
+///
+/// The loop draws when it has a reason to: a `RedrawNotify` raise from anything that changed what
+/// is on screen, or one of the few views that legitimately move on their own
+/// ([`PeriodicRefresh`], plus the cover-art compositor's scheduled re-transmissions). Between
+/// those it blocks, holding no `ui_state`/`view` guard.
 pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal) -> Result<()> {
-    let ui_refresh_duration = std::time::Duration::from_millis(
-        config::get_config().app_config.app_refresh_duration_in_ms,
-    );
+    let refresh = Duration::from_millis(config::get_config().app_config.app_refresh_duration_in_ms);
+
+    let mut periodic = PeriodicRefresh::default();
+    let mut retry_at = Instant::now();
 
     loop {
-        {
+        let now = Instant::now();
+
+        // Draw immediately when the last draw failed and its backoff has run out; otherwise wait
+        // for a raise or the earliest deadline this frame owes.
+        let deadline = if now < retry_at {
+            retry_at
+        } else {
+            let mut deadline = now + MAX_IDLE_WAIT;
+            if let Some(scheduled) = periodic.deadline(state, now, refresh) {
+                deadline = deadline.min(scheduled);
+            }
+            if let Some(cover) = cover_deadline(ui_state, now) {
+                deadline = deadline.min(cover);
+            }
+            deadline
+        };
+
+        let signalled = state
+            .redraw
+            .wait_timeout(deadline.saturating_duration_since(now));
+        if !signalled && Instant::now() < deadline {
+            // Nothing changed and no deadline is due yet: keep waiting.
+            continue;
+        }
+
+        let drawn_at = Instant::now();
+        // Ignore raises from this thread's own render path: a draw that logs must be retried on
+        // the policy below, not on the log line it just wrote.
+        let frame = state.redraw.frame();
+
+        let result = {
             let mut tui = ui_state.lock();
             let mut ui = Ctx::new(state.view.lock(), &mut tui);
 
             if !ui.is_running {
+                // Every path that clears `is_running` (the quit key, the CLI, media control)
+                // raises, so the loop is awake here rather than parked.
                 clean_up(terminal).context("clean up UI resources")?;
                 std::process::exit(0);
             }
@@ -58,20 +117,101 @@ pub fn run(state: &SharedState, ui_state: &SharedUiState, mut terminal: Terminal
             // Frame-skip detection: surfaces idle for a pass are healed on their next render.
             ui.tui.image_compositor.begin_frame();
 
-            if let Err(err) = terminal.draw(|frame| {
+            terminal.draw(|frame| {
                 // set the background and foreground colors for the application
                 let rect = frame.area();
                 let block = Block::default().style(ui.tui.theme.app());
                 frame.render_widget(block, rect);
 
                 render_application(frame, state, &mut ui, rect);
-            }) {
+            })
+        };
+        drop(frame);
+
+        match result {
+            Ok(_) => {
+                periodic.serviced(drawn_at);
+                retry_at = drawn_at;
+            }
+            Err(err) => {
                 tracing::error!("Failed to render the application: {err:#}");
+                retry_at = Instant::now() + DRAW_FAILURE_BACKOFF;
             }
         }
-
-        std::thread::sleep(ui_refresh_duration);
     }
+}
+
+/// The views whose content changes with the clock rather than with a state change, each with the
+/// frame it was last drawn in.
+///
+/// Their intervals are the display cadence: the visualizer interpolates its bars from the time
+/// since the audio sink's last write, so the frame rate *is* part of the picture; the progress
+/// bar reads a position that advances in real time.
+#[derive(Default)]
+struct PeriodicRefresh {
+    visualizer: Option<Instant>,
+    playback: Option<Instant>,
+    spinner: Option<Instant>,
+}
+
+impl PeriodicRefresh {
+    /// When the next of these is due, arming or clearing each against `state`.
+    ///
+    /// A view that stopped moving clears its timer, so an idle application wakes for none of them.
+    fn deadline(
+        &mut self,
+        state: &SharedState,
+        now: Instant,
+        refresh: Duration,
+    ) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        let mut arm = |timer: &mut Option<Instant>, running: bool, interval: Duration| {
+            if !running {
+                *timer = None;
+                return;
+            }
+            let at = timer.unwrap_or(now) + interval;
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
+        };
+
+        #[cfg(feature = "streaming")]
+        let visualizer = state.is_local_streaming_active();
+        #[cfg(not(feature = "streaming"))]
+        let visualizer = false;
+        arm(&mut self.visualizer, visualizer, refresh);
+
+        let (playing, awaiting_first_playback) = {
+            let player = state.player.read();
+            (
+                player.playback.as_ref().is_some_and(|p| p.is_playing),
+                player.playback_last_updated_time.is_none(),
+            )
+        };
+        arm(&mut self.playback, playing, PLAYBACK_REFRESH);
+        arm(&mut self.spinner, awaiting_first_playback, SPINNER_REFRESH);
+
+        earliest
+    }
+
+    /// Record a frame drawn at `now`, moving every running timer on.
+    fn serviced(&mut self, now: Instant) {
+        for timer in [&mut self.visualizer, &mut self.playback, &mut self.spinner] {
+            if timer.is_some() {
+                *timer = Some(now);
+            }
+        }
+    }
+}
+
+/// The cover-art compositor's next scheduled re-render, if the `image` feature is built in.
+#[cfg(feature = "image")]
+fn cover_deadline(ui_state: &SharedUiState, now: Instant) -> Option<Instant> {
+    ui_state.lock().image_compositor.next_deadline(now)
+}
+
+#[cfg(not(feature = "image"))]
+fn cover_deadline(_ui_state: &SharedUiState, _now: Instant) -> Option<Instant> {
+    None
 }
 
 pub fn init_terminal() -> Result<Terminal> {

@@ -97,6 +97,11 @@ pub fn start_event_watcher(
     };
     let mut controls = MediaControls::new(config)?;
 
+    // Captured for the handler: an event here changes what a frontend draws (playback state,
+    // volume, the started context) a moment later, when the client task applies it. Raising now
+    // keeps the media-control path self-sufficient instead of relying on that task's timing.
+    let redraw = state.redraw.clone();
+
     controls.attach(move |e| {
         tracing::info!("Got a media control event: {e:?}");
         match e {
@@ -176,6 +181,9 @@ pub fn start_event_watcher(
 
             _ => {}
         }
+
+        // Skipped by the `OpenUri` arm's early return: a uri it cannot parse dispatches nothing.
+        redraw.raise();
     })?;
     // For some reason, on startup, media playback needs to be initialized with `Playing`
     // for the track metadata to be shown up on the MacOS media status bar.

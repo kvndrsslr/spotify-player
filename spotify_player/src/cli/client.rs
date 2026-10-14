@@ -90,6 +90,14 @@ pub async fn start_socket(
                 }
                 .instrument(span)
                 .await;
+
+                // A socket command mutates the same state a frontend draws (a playback command
+                // writes `buffered_playback` directly; the rest go through the client task).
+                // Raise once per request on the socket's own path so the UI never waits on the
+                // request's async fallout.
+                if let Some(state) = state {
+                    state.redraw.raise();
+                }
             }
         }
     }
@@ -465,6 +473,9 @@ async fn handle_playback_request(
                         // update application's states
                         state.player.write().buffered_playback = playback;
                         client.update_playback(&state);
+                        // The write above is the visible change; `update_playback`'s polls follow
+                        // on their own schedule and would not be enough to show it now.
+                        state.redraw.raise();
                     }
                     Err(err) => {
                         tracing::warn!(

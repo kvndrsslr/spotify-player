@@ -143,6 +143,7 @@ fn fixture() -> SharedState {
     let state = Arc::new(spotify_player_core::state::State::new(
         false,
         Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
+        spotify_player_core::state::RedrawNotify::new(),
     ));
 
     {

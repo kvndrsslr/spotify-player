@@ -24,7 +24,7 @@ pub fn start_event_handler(
 ) {
     while let Ok(event) = crossterm::event::read() {
         let _enter = tracing::info_span!("terminal_event", event = ?event).entered();
-        if let Err(err) = match event {
+        let handled = match event {
             crossterm::event::Event::Mouse(event) => {
                 handle_mouse_event(event, client_pub, state, ui_state)
             }
@@ -44,9 +44,14 @@ pub fn start_event_handler(
                 }
             }
             _ => Ok(()),
-        } {
+        };
+        if let Err(err) = handled {
             tracing::error!("Failed to handle terminal event: {err:#}");
         }
+        // The whole input path's choke point: a key moves a cursor/page/popup or edits a text
+        // buffer, a resize re-lays out, a click seeks, a scroll changes the volume. All of it
+        // reaches the screen through a redraw, so raise once per event rather than per command.
+        state.redraw.raise();
     }
 }
 

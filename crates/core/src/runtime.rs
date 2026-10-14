@@ -31,8 +31,15 @@ pub struct Runtime {
 /// Initializes the application's logging: `log_folder`'s log file, the in-memory buffer a log view
 /// reads ([`state::State::logs`]) and the panic backtrace file.
 ///
+/// `redraw` is the signal in the state the caller is about to build: the buffer layer raises it so
+/// a log view redraws on new lines.
+///
 /// Does nothing when `RUST_LOG=off`.
-pub fn init_logging(log_folder: &Path, log_buffer: Arc<Mutex<VecDeque<String>>>) -> Result<()> {
+pub fn init_logging(
+    log_folder: &Path,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
+    redraw: state::RedrawNotify,
+) -> Result<()> {
     if std::env::var_os("RUST_LOG").is_some_and(|x| x == "off") {
         // Don't create log files if logging is disabled.
         return Ok(());
@@ -58,7 +65,7 @@ pub fn init_logging(log_folder: &Path, log_buffer: Arc<Mutex<VecDeque<String>>>)
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(log_file));
 
-    let buffer_layer = crate::log_layer::BufferLayer::new(log_buffer, 1000);
+    let buffer_layer = crate::log_layer::BufferLayer::new(log_buffer, 1000, redraw);
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
